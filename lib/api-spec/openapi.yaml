@@ -3,20 +3,38 @@ info:
   # Do not change the title, if the title changes, the import paths will be broken
   title: Api
   version: 0.1.0
-  description: API specification
+  description: ATM Back Office API
 servers:
   - url: /api
     description: Base API path
 tags:
   - name: health
     description: Health operations
+  - name: atms
+    description: ATM machine management
+  - name: dashboard
+    description: Dashboard summaries and analytics
+  - name: portals
+    description: Portal credential management and sync
+  - name: cash-planning
+    description: Cash fill planning and recommendations
+  - name: routes
+    description: Route planning for ATM fills
+  - name: alerts
+    description: Alert management
+  - name: bookkeeping
+    description: Financial accounts and transactions
+  - name: mileage
+    description: Mileage log management
+  - name: payroll
+    description: Employee and payroll management
+
 paths:
   /healthz:
     get:
       operationId: healthCheck
       tags: [health]
       summary: Health check
-      description: Returns server health status
       responses:
         "200":
           description: Healthy
@@ -24,6 +42,908 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+
+  # ─── ATMs ───────────────────────────────────────────────────────────────────
+  /atms:
+    get:
+      operationId: listAtms
+      tags: [atms]
+      summary: List all ATMs with current status
+      parameters:
+        - in: query
+          name: status
+          schema:
+            type: string
+            enum: [online, offline, error, low_cash, all]
+          required: false
+        - in: query
+          name: portal
+          schema:
+            type: string
+          required: false
+      responses:
+        "200":
+          description: List of ATMs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Atm"
+    post:
+      operationId: createAtm
+      tags: [atms]
+      summary: Create a new ATM record
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAtmBody"
+      responses:
+        "201":
+          description: Created ATM
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Atm"
+
+  /atms/{id}:
+    get:
+      operationId: getAtm
+      tags: [atms]
+      summary: Get ATM detail
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: ATM detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AtmDetail"
+    put:
+      operationId: updateAtm
+      tags: [atms]
+      summary: Update ATM record
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateAtmBody"
+      responses:
+        "200":
+          description: Updated ATM
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Atm"
+    delete:
+      operationId: deleteAtm
+      tags: [atms]
+      summary: Delete ATM record
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      responses:
+        "204":
+          description: Deleted
+
+  /atms/{id}/transactions:
+    get:
+      operationId: getAtmTransactions
+      tags: [atms]
+      summary: Get ATM transaction history
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+        - in: query
+          name: days
+          schema:
+            type: integer
+            default: 30
+      responses:
+        "200":
+          description: Transaction history
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/AtmTransaction"
+
+  # ─── Dashboard ──────────────────────────────────────────────────────────────
+  /dashboard/summary:
+    get:
+      operationId: getDashboardSummary
+      tags: [dashboard]
+      summary: Get dashboard summary stats
+      responses:
+        "200":
+          description: Dashboard summary
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DashboardSummary"
+
+  /dashboard/cash-flow:
+    get:
+      operationId: getDashboardCashFlow
+      tags: [dashboard]
+      summary: Get daily cash flow data for charts
+      parameters:
+        - in: query
+          name: days
+          schema:
+            type: integer
+            default: 30
+      responses:
+        "200":
+          description: Cash flow chart data
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/CashFlowDataPoint"
+
+  /dashboard/top-atms:
+    get:
+      operationId: getDashboardTopAtms
+      tags: [dashboard]
+      summary: Get top performing ATMs by transaction volume
+      responses:
+        "200":
+          description: Top ATMs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/AtmPerformance"
+
+  /dashboard/alerts-summary:
+    get:
+      operationId: getDashboardAlertsSummary
+      tags: [dashboard]
+      summary: Get active alerts grouped by severity
+      responses:
+        "200":
+          description: Alerts summary
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AlertsSummary"
+
+  # ─── Portals ────────────────────────────────────────────────────────────────
+  /portals:
+    get:
+      operationId: listPortals
+      tags: [portals]
+      summary: List portal credentials
+      responses:
+        "200":
+          description: Portal credentials (passwords omitted)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Portal"
+    post:
+      operationId: createPortal
+      tags: [portals]
+      summary: Add a new portal credential
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatePortalBody"
+      responses:
+        "201":
+          description: Created portal
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Portal"
+
+  /portals/{id}:
+    put:
+      operationId: updatePortal
+      tags: [portals]
+      summary: Update portal credential
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdatePortalBody"
+      responses:
+        "200":
+          description: Updated portal
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Portal"
+    delete:
+      operationId: deletePortal
+      tags: [portals]
+      summary: Delete portal credential
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      responses:
+        "204":
+          description: Deleted
+
+  /portals/{id}/sync:
+    post:
+      operationId: syncPortal
+      tags: [portals]
+      summary: Trigger sync for a specific portal
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Sync result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SyncResult"
+
+  /portals/sync-all:
+    post:
+      operationId: syncAllPortals
+      tags: [portals]
+      summary: Trigger sync for all portals
+      responses:
+        "200":
+          description: Sync results for all portals
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SyncResult"
+
+  /portals/sync-history:
+    get:
+      operationId: getPortalSyncHistory
+      tags: [portals]
+      summary: Get recent sync history
+      responses:
+        "200":
+          description: Sync history
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SyncHistory"
+
+  # ─── Cash Planning ──────────────────────────────────────────────────────────
+  /cash-planning/calculate:
+    post:
+      operationId: calculateFills
+      tags: [cash-planning]
+      summary: Calculate how much cash to load in each ATM for N days
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CalculateFillsBody"
+      responses:
+        "200":
+          description: Fill recommendations
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/FillRecommendation"
+
+  /fills:
+    get:
+      operationId: listFills
+      tags: [cash-planning]
+      summary: List fill orders
+      parameters:
+        - in: query
+          name: status
+          schema:
+            type: string
+            enum: [pending, in_progress, completed, all]
+          required: false
+      responses:
+        "200":
+          description: Fill orders
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/FillOrder"
+    post:
+      operationId: createFill
+      tags: [cash-planning]
+      summary: Create a fill order
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateFillBody"
+      responses:
+        "201":
+          description: Created fill order
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FillOrder"
+
+  /fills/{id}:
+    put:
+      operationId: updateFill
+      tags: [cash-planning]
+      summary: Update fill order status
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateFillBody"
+      responses:
+        "200":
+          description: Updated fill order
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FillOrder"
+
+  # ─── Routes ─────────────────────────────────────────────────────────────────
+  /routes:
+    get:
+      operationId: listRoutes
+      tags: [routes]
+      summary: List planned routes
+      responses:
+        "200":
+          description: Routes
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Route"
+    post:
+      operationId: planRoute
+      tags: [routes]
+      summary: Plan an optimized fill route
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PlanRouteBody"
+      responses:
+        "201":
+          description: Planned route
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Route"
+
+  /routes/{id}:
+    get:
+      operationId: getRoute
+      tags: [routes]
+      summary: Get route detail with stops
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Route detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RouteDetail"
+    put:
+      operationId: updateRoute
+      tags: [routes]
+      summary: Update route status
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateRouteBody"
+      responses:
+        "200":
+          description: Updated route
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Route"
+
+  # ─── Alerts ─────────────────────────────────────────────────────────────────
+  /alerts:
+    get:
+      operationId: listAlerts
+      tags: [alerts]
+      summary: List alerts
+      parameters:
+        - in: query
+          name: severity
+          schema:
+            type: string
+            enum: [critical, warning, info, all]
+          required: false
+        - in: query
+          name: resolved
+          schema:
+            type: boolean
+          required: false
+      responses:
+        "200":
+          description: Alerts
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Alert"
+
+  /alerts/{id}/resolve:
+    put:
+      operationId: resolveAlert
+      tags: [alerts]
+      summary: Resolve an alert
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Resolved alert
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Alert"
+
+  /alert-rules:
+    get:
+      operationId: listAlertRules
+      tags: [alerts]
+      summary: List alert rules
+      responses:
+        "200":
+          description: Alert rules
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/AlertRule"
+    post:
+      operationId: createAlertRule
+      tags: [alerts]
+      summary: Create alert rule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAlertRuleBody"
+      responses:
+        "201":
+          description: Created alert rule
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AlertRule"
+
+  /alert-rules/{id}:
+    delete:
+      operationId: deleteAlertRule
+      tags: [alerts]
+      summary: Delete alert rule
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      responses:
+        "204":
+          description: Deleted
+
+  # ─── Bookkeeping ────────────────────────────────────────────────────────────
+  /accounts:
+    get:
+      operationId: listAccounts
+      tags: [bookkeeping]
+      summary: List financial accounts
+      responses:
+        "200":
+          description: Accounts
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Account"
+    post:
+      operationId: createAccount
+      tags: [bookkeeping]
+      summary: Add a financial account
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAccountBody"
+      responses:
+        "201":
+          description: Created account
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Account"
+
+  /accounts/{id}:
+    put:
+      operationId: updateAccount
+      tags: [bookkeeping]
+      summary: Update account
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateAccountBody"
+      responses:
+        "200":
+          description: Updated account
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Account"
+    delete:
+      operationId: deleteAccount
+      tags: [bookkeeping]
+      summary: Delete account
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      responses:
+        "204":
+          description: Deleted
+
+  /book-transactions:
+    get:
+      operationId: listBookTransactions
+      tags: [bookkeeping]
+      summary: List financial transactions
+      parameters:
+        - in: query
+          name: accountId
+          schema:
+            type: integer
+          required: false
+        - in: query
+          name: category
+          schema:
+            type: string
+          required: false
+        - in: query
+          name: startDate
+          schema:
+            type: string
+            format: date
+          required: false
+        - in: query
+          name: endDate
+          schema:
+            type: string
+            format: date
+          required: false
+      responses:
+        "200":
+          description: Transactions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/BookTransaction"
+    post:
+      operationId: createBookTransaction
+      tags: [bookkeeping]
+      summary: Add a financial transaction
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateBookTransactionBody"
+      responses:
+        "201":
+          description: Created transaction
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookTransaction"
+
+  /book-transactions/{id}:
+    delete:
+      operationId: deleteBookTransaction
+      tags: [bookkeeping]
+      summary: Delete transaction
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      responses:
+        "204":
+          description: Deleted
+
+  /bookkeeping/summary:
+    get:
+      operationId: getBookkeepingSummary
+      tags: [bookkeeping]
+      summary: Get income/expense summary by category
+      parameters:
+        - in: query
+          name: startDate
+          schema:
+            type: string
+            format: date
+          required: false
+        - in: query
+          name: endDate
+          schema:
+            type: string
+            format: date
+          required: false
+      responses:
+        "200":
+          description: Bookkeeping summary
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookkeepingSummary"
+
+  # ─── Mileage ────────────────────────────────────────────────────────────────
+  /mileage:
+    get:
+      operationId: listMileageLogs
+      tags: [mileage]
+      summary: List mileage logs
+      parameters:
+        - in: query
+          name: startDate
+          schema:
+            type: string
+            format: date
+          required: false
+        - in: query
+          name: endDate
+          schema:
+            type: string
+            format: date
+          required: false
+      responses:
+        "200":
+          description: Mileage logs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/MileageLog"
+    post:
+      operationId: createMileageLog
+      tags: [mileage]
+      summary: Add a mileage log entry
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateMileageLogBody"
+      responses:
+        "201":
+          description: Created mileage log
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MileageLog"
+
+  /mileage/{id}:
+    delete:
+      operationId: deleteMileageLog
+      tags: [mileage]
+      summary: Delete mileage log
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      responses:
+        "204":
+          description: Deleted
+
+  /mileage/summary:
+    get:
+      operationId: getMileageSummary
+      tags: [mileage]
+      summary: Get total mileage stats
+      responses:
+        "200":
+          description: Mileage summary
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MileageSummary"
+
+  # ─── Payroll ────────────────────────────────────────────────────────────────
+  /employees:
+    get:
+      operationId: listEmployees
+      tags: [payroll]
+      summary: List employees
+      responses:
+        "200":
+          description: Employees
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Employee"
+    post:
+      operationId: createEmployee
+      tags: [payroll]
+      summary: Add an employee
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateEmployeeBody"
+      responses:
+        "201":
+          description: Created employee
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Employee"
+
+  /employees/{id}:
+    put:
+      operationId: updateEmployee
+      tags: [payroll]
+      summary: Update employee
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateEmployeeBody"
+      responses:
+        "200":
+          description: Updated employee
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Employee"
+
+  /payroll:
+    get:
+      operationId: listPayroll
+      tags: [payroll]
+      summary: List payroll records
+      parameters:
+        - in: query
+          name: employeeId
+          schema:
+            type: integer
+          required: false
+      responses:
+        "200":
+          description: Payroll records
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/PayrollRecord"
+    post:
+      operationId: createPayroll
+      tags: [payroll]
+      summary: Create a payroll record
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatePayrollBody"
+      responses:
+        "201":
+          description: Created payroll record
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PayrollRecord"
+
 components:
   schemas:
     HealthStatus:
@@ -31,6 +951,1029 @@ components:
       properties:
         status:
           type: string
+      required: [status]
+
+    # ── ATM ──
+    Atm:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        locationName:
+          type: string
+        address:
+          type: string
+        city:
+          type: string
+        state:
+          type: string
+        latitude:
+          type: number
+        longitude:
+          type: number
+        serialNumber:
+          type: string
+        portalSource:
+          type: string
+          enum: [columbus_data, switch_commerce, atm_transact, manual]
+        portalAtmId:
+          type: string
+        cashCapacity:
+          type: number
+        currentBalance:
+          type: number
+        lowCashThreshold:
+          type: number
+        status:
+          type: string
+          enum: [online, offline, error, low_cash, unknown]
+        lastSynced:
+          type: string
+          format: date-time
+        avgDailyTransactions:
+          type: number
+        avgDailyDispensed:
+          type: number
+        createdAt:
+          type: string
+          format: date-time
       required:
+        - id
+        - name
+        - locationName
+        - address
+        - city
+        - state
+        - portalSource
+        - cashCapacity
+        - currentBalance
+        - lowCashThreshold
+        - status
+        - createdAt
+
+    AtmDetail:
+      allOf:
+        - $ref: "#/components/schemas/Atm"
+        - type: object
+          properties:
+            recentAlerts:
+              type: array
+              items:
+                $ref: "#/components/schemas/Alert"
+            fillHistory:
+              type: array
+              items:
+                $ref: "#/components/schemas/FillOrder"
+
+    CreateAtmBody:
+      type: object
+      properties:
+        name:
+          type: string
+        locationName:
+          type: string
+        address:
+          type: string
+        city:
+          type: string
+        state:
+          type: string
+        latitude:
+          type: number
+        longitude:
+          type: number
+        serialNumber:
+          type: string
+        portalSource:
+          type: string
+          enum: [columbus_data, switch_commerce, atm_transact, manual]
+        portalAtmId:
+          type: string
+        cashCapacity:
+          type: number
+        lowCashThreshold:
+          type: number
+      required:
+        - name
+        - locationName
+        - address
+        - city
+        - state
+        - portalSource
+        - cashCapacity
+        - lowCashThreshold
+
+    UpdateAtmBody:
+      type: object
+      properties:
+        name:
+          type: string
+        locationName:
+          type: string
+        address:
+          type: string
+        city:
+          type: string
+        state:
+          type: string
+        latitude:
+          type: number
+        longitude:
+          type: number
+        serialNumber:
+          type: string
+        cashCapacity:
+          type: number
+        lowCashThreshold:
+          type: number
+        status:
+          type: string
+          enum: [online, offline, error, low_cash, unknown]
+
+    AtmTransaction:
+      type: object
+      properties:
+        id:
+          type: integer
+        atmId:
+          type: integer
+        date:
+          type: string
+          format: date
+        transactionCount:
+          type: integer
+        totalDispensed:
+          type: number
+        createdAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - atmId
+        - date
+        - transactionCount
+        - totalDispensed
+        - createdAt
+
+    # ── Dashboard ──
+    DashboardSummary:
+      type: object
+      properties:
+        totalAtms:
+          type: integer
+        onlineAtms:
+          type: integer
+        offlineAtms:
+          type: integer
+        lowCashAtms:
+          type: integer
+        errorAtms:
+          type: integer
+        totalCashDeployed:
+          type: number
+        totalActiveAlerts:
+          type: integer
+        criticalAlerts:
+          type: integer
+        pendingFills:
+          type: integer
+        avgDailyTransactions:
+          type: number
+        todayDispensed:
+          type: number
+        monthlyRevenue:
+          type: number
+      required:
+        - totalAtms
+        - onlineAtms
+        - offlineAtms
+        - lowCashAtms
+        - errorAtms
+        - totalCashDeployed
+        - totalActiveAlerts
+        - criticalAlerts
+        - pendingFills
+        - avgDailyTransactions
+        - todayDispensed
+        - monthlyRevenue
+
+    CashFlowDataPoint:
+      type: object
+      properties:
+        date:
+          type: string
+        dispensed:
+          type: number
+        transactions:
+          type: integer
+      required: [date, dispensed, transactions]
+
+    AtmPerformance:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        locationName:
+          type: string
+        avgDailyTransactions:
+          type: number
+        avgDailyDispensed:
+          type: number
+        currentBalance:
+          type: number
+        status:
+          type: string
+      required:
+        - id
+        - name
+        - locationName
+        - avgDailyTransactions
+        - avgDailyDispensed
+        - currentBalance
         - status
 
+    AlertsSummary:
+      type: object
+      properties:
+        critical:
+          type: integer
+        warning:
+          type: integer
+        info:
+          type: integer
+        totalUnresolved:
+          type: integer
+      required: [critical, warning, info, totalUnresolved]
+
+    # ── Portals ──
+    Portal:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+          enum: [columbus_data, switch_commerce, atm_transact]
+        displayName:
+          type: string
+        url:
+          type: string
+        username:
+          type: string
+        isActive:
+          type: boolean
+        lastSynced:
+          type: string
+          format: date-time
+        lastSyncStatus:
+          type: string
+          enum: [success, failed, pending, never]
+        atmCount:
+          type: integer
+        createdAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - name
+        - displayName
+        - url
+        - username
+        - isActive
+        - lastSyncStatus
+        - createdAt
+
+    CreatePortalBody:
+      type: object
+      properties:
+        name:
+          type: string
+          enum: [columbus_data, switch_commerce, atm_transact]
+        username:
+          type: string
+        password:
+          type: string
+      required: [name, username, password]
+
+    UpdatePortalBody:
+      type: object
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+        isActive:
+          type: boolean
+
+    SyncResult:
+      type: object
+      properties:
+        portalId:
+          type: integer
+        portalName:
+          type: string
+        success:
+          type: boolean
+        message:
+          type: string
+        atmsUpdated:
+          type: integer
+        alertsCreated:
+          type: integer
+        syncedAt:
+          type: string
+          format: date-time
+      required:
+        - portalId
+        - portalName
+        - success
+        - message
+        - atmsUpdated
+        - alertsCreated
+        - syncedAt
+
+    SyncHistory:
+      type: object
+      properties:
+        id:
+          type: integer
+        portalId:
+          type: integer
+        portalName:
+          type: string
+        success:
+          type: boolean
+        message:
+          type: string
+        atmsUpdated:
+          type: integer
+        syncedAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - portalId
+        - portalName
+        - success
+        - message
+        - atmsUpdated
+        - syncedAt
+
+    # ── Cash Planning ──
+    CalculateFillsBody:
+      type: object
+      properties:
+        atmIds:
+          type: array
+          items:
+            type: integer
+        daysToFill:
+          type: integer
+          minimum: 1
+          maximum: 90
+        bufferPercent:
+          type: number
+          default: 10
+      required: [atmIds, daysToFill]
+
+    FillRecommendation:
+      type: object
+      properties:
+        atmId:
+          type: integer
+        atmName:
+          type: string
+        locationName:
+          type: string
+        currentBalance:
+          type: number
+        avgDailyDispensed:
+          type: number
+        recommendedLoad:
+          type: number
+        totalNeeded:
+          type: number
+        daysToFill:
+          type: integer
+        cashCapacity:
+          type: number
+        priority:
+          type: string
+          enum: [critical, high, medium, low]
+      required:
+        - atmId
+        - atmName
+        - locationName
+        - currentBalance
+        - avgDailyDispensed
+        - recommendedLoad
+        - totalNeeded
+        - daysToFill
+        - cashCapacity
+        - priority
+
+    FillOrder:
+      type: object
+      properties:
+        id:
+          type: integer
+        atmId:
+          type: integer
+        atmName:
+          type: string
+        locationName:
+          type: string
+        scheduledDate:
+          type: string
+          format: date
+        cashAmount:
+          type: number
+        daysToFill:
+          type: integer
+        status:
+          type: string
+          enum: [pending, in_progress, completed, cancelled]
+        notes:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        completedAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - atmId
+        - atmName
+        - locationName
+        - scheduledDate
+        - cashAmount
+        - daysToFill
+        - status
+        - createdAt
+
+    CreateFillBody:
+      type: object
+      properties:
+        atmId:
+          type: integer
+        scheduledDate:
+          type: string
+          format: date
+        cashAmount:
+          type: number
+        daysToFill:
+          type: integer
+        notes:
+          type: string
+      required: [atmId, scheduledDate, cashAmount, daysToFill]
+
+    UpdateFillBody:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [pending, in_progress, completed, cancelled]
+        notes:
+          type: string
+        cashAmount:
+          type: number
+
+    # ── Routes ──
+    Route:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        scheduledDate:
+          type: string
+          format: date
+        status:
+          type: string
+          enum: [planned, in_progress, completed, cancelled]
+        stopCount:
+          type: integer
+        totalCashNeeded:
+          type: number
+        estimatedDistanceMiles:
+          type: number
+        estimatedDurationMinutes:
+          type: integer
+        startAddress:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        completedAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - name
+        - scheduledDate
+        - status
+        - stopCount
+        - totalCashNeeded
+        - createdAt
+
+    RouteDetail:
+      allOf:
+        - $ref: "#/components/schemas/Route"
+        - type: object
+          properties:
+            stops:
+              type: array
+              items:
+                $ref: "#/components/schemas/RouteStop"
+
+    RouteStop:
+      type: object
+      properties:
+        id:
+          type: integer
+        routeId:
+          type: integer
+        stopOrder:
+          type: integer
+        atmId:
+          type: integer
+        atmName:
+          type: string
+        locationName:
+          type: string
+        address:
+          type: string
+        cashToLoad:
+          type: number
+        currentBalance:
+          type: number
+        status:
+          type: string
+          enum: [pending, completed, skipped]
+      required:
+        - id
+        - routeId
+        - stopOrder
+        - atmId
+        - atmName
+        - locationName
+        - address
+        - cashToLoad
+        - currentBalance
+        - status
+
+    PlanRouteBody:
+      type: object
+      properties:
+        name:
+          type: string
+        scheduledDate:
+          type: string
+          format: date
+        atmIds:
+          type: array
+          items:
+            type: integer
+        daysToFill:
+          type: integer
+        startAddress:
+          type: string
+      required: [name, scheduledDate, atmIds, daysToFill]
+
+    UpdateRouteBody:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [planned, in_progress, completed, cancelled]
+
+    # ── Alerts ──
+    Alert:
+      type: object
+      properties:
+        id:
+          type: integer
+        atmId:
+          type: integer
+        atmName:
+          type: string
+        type:
+          type: string
+          enum: [low_cash, machine_error, offline, out_of_cash, sync_failed, custom]
+        severity:
+          type: string
+          enum: [critical, warning, info]
+        message:
+          type: string
+        resolved:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+        resolvedAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - type
+        - severity
+        - message
+        - resolved
+        - createdAt
+
+    AlertRule:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        type:
+          type: string
+          enum: [low_cash, machine_error, offline, out_of_cash]
+        threshold:
+          type: number
+        severity:
+          type: string
+          enum: [critical, warning, info]
+        isActive:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - name
+        - type
+        - severity
+        - isActive
+        - createdAt
+
+    CreateAlertRuleBody:
+      type: object
+      properties:
+        name:
+          type: string
+        type:
+          type: string
+          enum: [low_cash, machine_error, offline, out_of_cash]
+        threshold:
+          type: number
+        severity:
+          type: string
+          enum: [critical, warning, info]
+      required: [name, type, severity]
+
+    # ── Bookkeeping ──
+    Account:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        type:
+          type: string
+          enum: [checking, savings, credit_card, cash, other]
+        institution:
+          type: string
+        lastFour:
+          type: string
+        balance:
+          type: number
+        isActive:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - name
+        - type
+        - institution
+        - balance
+        - isActive
+        - createdAt
+
+    CreateAccountBody:
+      type: object
+      properties:
+        name:
+          type: string
+        type:
+          type: string
+          enum: [checking, savings, credit_card, cash, other]
+        institution:
+          type: string
+        lastFour:
+          type: string
+        balance:
+          type: number
+      required: [name, type, institution, balance]
+
+    UpdateAccountBody:
+      type: object
+      properties:
+        name:
+          type: string
+        balance:
+          type: number
+        isActive:
+          type: boolean
+
+    BookTransaction:
+      type: object
+      properties:
+        id:
+          type: integer
+        accountId:
+          type: integer
+        accountName:
+          type: string
+        date:
+          type: string
+          format: date
+        description:
+          type: string
+        amount:
+          type: number
+        type:
+          type: string
+          enum: [income, expense]
+        category:
+          type: string
+        notes:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - accountId
+        - accountName
+        - date
+        - description
+        - amount
+        - type
+        - category
+        - createdAt
+
+    CreateBookTransactionBody:
+      type: object
+      properties:
+        accountId:
+          type: integer
+        date:
+          type: string
+          format: date
+        description:
+          type: string
+        amount:
+          type: number
+        type:
+          type: string
+          enum: [income, expense]
+        category:
+          type: string
+        notes:
+          type: string
+      required: [accountId, date, description, amount, type, category]
+
+    BookkeepingSummary:
+      type: object
+      properties:
+        totalIncome:
+          type: number
+        totalExpenses:
+          type: number
+        netProfit:
+          type: number
+        byCategory:
+          type: array
+          items:
+            type: object
+            properties:
+              category:
+                type: string
+              type:
+                type: string
+              total:
+                type: number
+            required: [category, type, total]
+      required: [totalIncome, totalExpenses, netProfit, byCategory]
+
+    # ── Mileage ──
+    MileageLog:
+      type: object
+      properties:
+        id:
+          type: integer
+        date:
+          type: string
+          format: date
+        startLocation:
+          type: string
+        endLocation:
+          type: string
+        miles:
+          type: number
+        purpose:
+          type: string
+        routeId:
+          type: integer
+        notes:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - date
+        - startLocation
+        - endLocation
+        - miles
+        - purpose
+        - createdAt
+
+    CreateMileageLogBody:
+      type: object
+      properties:
+        date:
+          type: string
+          format: date
+        startLocation:
+          type: string
+        endLocation:
+          type: string
+        miles:
+          type: number
+        purpose:
+          type: string
+        routeId:
+          type: integer
+        notes:
+          type: string
+      required: [date, startLocation, endLocation, miles, purpose]
+
+    MileageSummary:
+      type: object
+      properties:
+        totalMiles:
+          type: number
+        totalTrips:
+          type: integer
+        monthlyMiles:
+          type: number
+        yearlyMiles:
+          type: number
+        irsDeduction:
+          type: number
+      required:
+        - totalMiles
+        - totalTrips
+        - monthlyMiles
+        - yearlyMiles
+        - irsDeduction
+
+    # ── Payroll ──
+    Employee:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        email:
+          type: string
+        role:
+          type: string
+        payType:
+          type: string
+          enum: [hourly, salary, contractor]
+        payRate:
+          type: number
+        isActive:
+          type: boolean
+        startDate:
+          type: string
+          format: date
+        createdAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - name
+        - role
+        - payType
+        - payRate
+        - isActive
+        - createdAt
+
+    CreateEmployeeBody:
+      type: object
+      properties:
+        name:
+          type: string
+        email:
+          type: string
+        role:
+          type: string
+        payType:
+          type: string
+          enum: [hourly, salary, contractor]
+        payRate:
+          type: number
+        startDate:
+          type: string
+          format: date
+      required: [name, role, payType, payRate]
+
+    UpdateEmployeeBody:
+      type: object
+      properties:
+        name:
+          type: string
+        email:
+          type: string
+        role:
+          type: string
+        payType:
+          type: string
+          enum: [hourly, salary, contractor]
+        payRate:
+          type: number
+        isActive:
+          type: boolean
+
+    PayrollRecord:
+      type: object
+      properties:
+        id:
+          type: integer
+        employeeId:
+          type: integer
+        employeeName:
+          type: string
+        periodStart:
+          type: string
+          format: date
+        periodEnd:
+          type: string
+          format: date
+        hoursWorked:
+          type: number
+        grossPay:
+          type: number
+        deductions:
+          type: number
+        netPay:
+          type: number
+        status:
+          type: string
+          enum: [pending, approved, paid]
+        paidAt:
+          type: string
+          format: date-time
+        notes:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - employeeId
+        - employeeName
+        - periodStart
+        - periodEnd
+        - grossPay
+        - deductions
+        - netPay
+        - status
+        - createdAt
+
+    CreatePayrollBody:
+      type: object
+      properties:
+        employeeId:
+          type: integer
+        periodStart:
+          type: string
+          format: date
+        periodEnd:
+          type: string
+          format: date
+        hoursWorked:
+          type: number
+        grossPay:
+          type: number
+        deductions:
+          type: number
+        notes:
+          type: string
+      required: [employeeId, periodStart, periodEnd, grossPay, deductions]
