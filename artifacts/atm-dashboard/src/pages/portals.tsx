@@ -8,11 +8,10 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useToast } from "@/hooks/use-toast";
 import { RefreshCw, Plus, CheckCircle, XCircle, Clock, Server } from "lucide-react";
-import type { CreatePortalBody } from "@workspace/api-client-react";
 
-function syncStatusBadge(s: string) {
-  if (s === "success") return <Badge className="bg-emerald-500/15 text-emerald-600 border-emerald-500/30 hover:bg-emerald-500/15"><CheckCircle className="w-3 h-3 mr-1" />Success</Badge>;
-  if (s === "failed") return <Badge className="bg-red-500/15 text-red-600 border-red-500/30 hover:bg-red-500/15"><XCircle className="w-3 h-3 mr-1" />Failed</Badge>;
+function syncStatusBadge(success: boolean | string | null | undefined) {
+  if (success === true || success === "success") return <Badge className="bg-emerald-500/15 text-emerald-600 border-emerald-500/30 hover:bg-emerald-500/15"><CheckCircle className="w-3 h-3 mr-1" />Success</Badge>;
+  if (success === false || success === "failed") return <Badge className="bg-red-500/15 text-red-600 border-red-500/30 hover:bg-red-500/15"><XCircle className="w-3 h-3 mr-1" />Failed</Badge>;
   return <Badge variant="secondary"><Clock className="w-3 h-3 mr-1" />Never synced</Badge>;
 }
 
@@ -23,25 +22,36 @@ function portalLabel(name: string) {
   return name;
 }
 
-const emptyPortal: CreatePortalBody = { name: "columbus_data", username: "", passwordEncrypted: "" };
+type PortalForm = { name: string; username: string; password: string };
+const emptyPortal: PortalForm = { name: "columbus_data", username: "", password: "" };
 
 export default function PortalsPage() {
   const { toast } = useToast();
   const [showAdd, setShowAdd] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
-  const [form, setForm] = useState<CreatePortalBody>(emptyPortal);
+  const [form, setForm] = useState<PortalForm>(emptyPortal);
   const [syncingId, setSyncingId] = useState<number | null>(null);
 
   const { data: portals = [], refetch } = useListPortals();
-  const createPortal = useCreatePortal({ mutation: { onSuccess: () => { refetch(); setShowAdd(false); setForm(emptyPortal); toast({ title: "Portal added" }); } } });
-  const updatePortal = useUpdatePortal({ mutation: { onSuccess: () => { refetch(); setEditingId(null); toast({ title: "Portal updated" }); } } });
+  const createPortal = useCreatePortal({
+    mutation: {
+      onSuccess: () => { refetch(); setShowAdd(false); setForm(emptyPortal); toast({ title: "Portal added" }); },
+      onError: () => { toast({ title: "Failed to add portal", variant: "destructive" }); }
+    }
+  });
+  const updatePortal = useUpdatePortal({
+    mutation: {
+      onSuccess: () => { refetch(); setEditingId(null); toast({ title: "Portal updated" }); },
+      onError: () => { toast({ title: "Failed to update portal", variant: "destructive" }); }
+    }
+  });
   const syncPortal = useSyncPortal({
     mutation: {
-      onMutate: (vars) => setSyncingId(vars.portalId),
+      onMutate: (vars) => setSyncingId(vars.id),
       onSuccess: (data) => {
         refetch();
         setSyncingId(null);
-        toast({ title: `Sync complete: ${data.updatedAtms} ATMs updated` });
+        toast({ title: `Sync complete: ${data.atmsUpdated} ATMs updated` });
       },
       onError: () => { setSyncingId(null); toast({ title: "Sync failed", variant: "destructive" }); }
     }
@@ -79,13 +89,13 @@ export default function PortalsPage() {
                   <Badge variant={portal.isActive ? "default" : "secondary"}>{portal.isActive ? "Active" : "Inactive"}</Badge>
                 </div>
                 <p className="text-sm text-muted-foreground">Username: {portal.username}</p>
-                {portal.lastSyncAt && (
-                  <p className="text-xs text-muted-foreground mt-0.5">Last synced: {new Date(portal.lastSyncAt).toLocaleString()}</p>
+                {portal.lastSynced && (
+                  <p className="text-xs text-muted-foreground mt-0.5">Last synced: {new Date(portal.lastSynced).toLocaleString()}</p>
                 )}
               </div>
               <div className="flex gap-2">
-                <Button variant="outline" size="sm" onClick={() => { setForm({ name: portal.name, username: portal.username, passwordEncrypted: "" }); setEditingId(portal.id); }}>Edit</Button>
-                <Button size="sm" disabled={syncingId === portal.id} onClick={() => syncPortal.mutate({ portalId: portal.id })}>
+                <Button variant="outline" size="sm" onClick={() => { setForm({ name: portal.name, username: portal.username, password: "" }); setEditingId(portal.id); }}>Edit</Button>
+                <Button size="sm" disabled={syncingId === portal.id} onClick={() => syncPortal.mutate({ id: portal.id })}>
                   <RefreshCw className={`w-4 h-4 mr-1 ${syncingId === portal.id ? "animate-spin" : ""}`} />
                   {syncingId === portal.id ? "Syncing..." : "Sync Now"}
                 </Button>
@@ -103,12 +113,12 @@ export default function PortalsPage() {
             {history.slice(0, 20).map(h => (
               <div key={h.id} className="flex items-center gap-4 p-3 text-sm">
                 <div className="flex-1">
-                  <span className="font-medium">{portalLabel(h.portalName)}</span>
-                  <span className="text-muted-foreground ml-2">{new Date(h.startedAt).toLocaleString()}</span>
+                  <span className="font-medium">{portalLabel(h.portalName ?? "")}</span>
+                  <span className="text-muted-foreground ml-2">{h.syncedAt ? new Date(h.syncedAt).toLocaleString() : ""}</span>
                 </div>
                 <span className="text-muted-foreground">{h.atmsUpdated ?? 0} ATMs updated</span>
-                {syncStatusBadge(h.status)}
-                {h.errorMessage && <span className="text-xs text-red-500 truncate max-w-48">{h.errorMessage}</span>}
+                {syncStatusBadge(h.success)}
+                {h.message && !h.success && <span className="text-xs text-red-500 truncate max-w-48">{h.message}</span>}
               </div>
             ))}
           </div>
@@ -132,11 +142,16 @@ export default function PortalsPage() {
               </Select>
             </div>
             <div><Label>Username / Email</Label><Input value={form.username} onChange={e => setForm(f => ({ ...f, username: e.target.value }))} placeholder="user@example.com" /></div>
-            <div><Label>Password</Label><Input type="password" value={form.passwordEncrypted} onChange={e => setForm(f => ({ ...f, passwordEncrypted: e.target.value }))} placeholder="Password" /></div>
+            <div><Label>Password</Label><Input type="password" value={form.password} onChange={e => setForm(f => ({ ...f, password: e.target.value }))} placeholder="Password" /></div>
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setShowAdd(false)}>Cancel</Button>
-            <Button onClick={() => createPortal.mutate({ data: form })} disabled={!form.username || !form.passwordEncrypted}>Save</Button>
+            <Button
+              onClick={() => createPortal.mutate({ data: { name: form.name as any, username: form.username, password: form.password } })}
+              disabled={!form.username || !form.password || createPortal.isPending}
+            >
+              {createPortal.isPending ? "Saving..." : "Save"}
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -147,11 +162,20 @@ export default function PortalsPage() {
           <DialogHeader><DialogTitle>Edit Portal Credentials</DialogTitle></DialogHeader>
           <div className="grid gap-3 py-2">
             <div><Label>Username / Email</Label><Input value={form.username} onChange={e => setForm(f => ({ ...f, username: e.target.value }))} /></div>
-            <div><Label>New Password</Label><Input type="password" value={form.passwordEncrypted} onChange={e => setForm(f => ({ ...f, passwordEncrypted: e.target.value }))} placeholder="Leave blank to keep current" /></div>
+            <div><Label>New Password</Label><Input type="password" value={form.password} onChange={e => setForm(f => ({ ...f, password: e.target.value }))} placeholder="Leave blank to keep current" /></div>
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setEditingId(null)}>Cancel</Button>
-            <Button onClick={() => editingId !== null && updatePortal.mutate({ portalId: editingId, data: { username: form.username, passwordEncrypted: form.passwordEncrypted || undefined } })}>Update</Button>
+            <Button
+              disabled={updatePortal.isPending}
+              onClick={() => {
+                if (editingId !== null) {
+                  updatePortal.mutate({ id: editingId, data: { username: form.username, password: form.password || undefined } });
+                }
+              }}
+            >
+              {updatePortal.isPending ? "Updating..." : "Update"}
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
