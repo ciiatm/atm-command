@@ -7,7 +7,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useToast } from "@/hooks/use-toast";
-import { Search, Plus, RefreshCw, MapPin, Wifi, WifiOff, AlertTriangle, Upload, ChevronRight, FileSpreadsheet, CheckCircle2, XCircle } from "lucide-react";
+import { Search, Plus, RefreshCw, MapPin, Wifi, WifiOff, AlertTriangle, Upload, ChevronRight, FileSpreadsheet, CheckCircle2, XCircle, Pencil, Trash2 } from "lucide-react";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 import type { Atm, CreateAtmBody } from "@workspace/api-client-react";
@@ -303,6 +303,97 @@ function ImportDialog({ open, onClose, onSuccess }: { open: boolean; onClose: ()
   );
 }
 
+// ---------------------------------------------------------------------------
+// Edit dialog
+// ---------------------------------------------------------------------------
+
+function EditDialog({ atm, onClose, onSaved }: { atm: Atm | null; onClose: () => void; onSaved: () => void }) {
+  const { toast } = useToast();
+  const [form, setForm] = useState<Partial<Atm>>({});
+
+  // Reset form whenever the target ATM changes
+  const prevId = useRef<number | null>(null);
+  if (atm && atm.id !== prevId.current) {
+    prevId.current = atm.id;
+    setForm({ ...atm });
+  }
+
+  const updateAtm = useUpdateAtm({
+    mutation: {
+      onSuccess: () => { toast({ title: "ATM updated" }); onSaved(); onClose(); },
+      onError: () => toast({ title: "Failed to save", variant: "destructive" }),
+    },
+  });
+
+  if (!atm) return null;
+  const f = { ...atm, ...form };
+
+  const set = (key: keyof Atm, val: any) => setForm(prev => ({ ...prev, [key]: val }));
+
+  return (
+    <Dialog open={!!atm} onOpenChange={onClose}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader><DialogTitle>Edit ATM</DialogTitle></DialogHeader>
+        <div className="grid gap-3 py-2">
+          <div className="grid grid-cols-2 gap-3">
+            <div><Label>Machine Name</Label><Input value={f.name} onChange={e => set("name", e.target.value)} /></div>
+            <div><Label>Location Name</Label><Input value={f.locationName} onChange={e => set("locationName", e.target.value)} /></div>
+          </div>
+          <div><Label>Address</Label><Input value={f.address} onChange={e => set("address", e.target.value)} /></div>
+          <div className="grid grid-cols-2 gap-3">
+            <div><Label>City</Label><Input value={f.city} onChange={e => set("city", e.target.value)} /></div>
+            <div><Label>State</Label><Input value={f.state} onChange={e => set("state", e.target.value)} maxLength={2} /></div>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div><Label>Capacity ($)</Label><Input type="number" value={f.cashCapacity} onChange={e => set("cashCapacity", +e.target.value)} /></div>
+            <div><Label>Low Cash Threshold ($)</Label><Input type="number" value={f.lowCashThreshold} onChange={e => set("lowCashThreshold", +e.target.value)} /></div>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div><Label>Current Balance ($)</Label><Input type="number" value={f.currentBalance} onChange={e => set("currentBalance", +e.target.value)} /></div>
+            <div>
+              <Label>Status</Label>
+              <Select value={f.status} onValueChange={v => set("status", v)}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="online">Online</SelectItem>
+                  <SelectItem value="offline">Offline</SelectItem>
+                  <SelectItem value="low_cash">Low Cash</SelectItem>
+                  <SelectItem value="error">Error</SelectItem>
+                  <SelectItem value="unknown">Unknown</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div><Label>Terminal ID</Label><Input value={f.portalAtmId ?? ""} onChange={e => set("portalAtmId", e.target.value)} placeholder="L443079" /></div>
+            <div>
+              <Label>Portal</Label>
+              <Select value={f.portalSource} onValueChange={v => set("portalSource", v)}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="columbus_data">Columbus Data</SelectItem>
+                  <SelectItem value="switch_commerce">Switch Commerce</SelectItem>
+                  <SelectItem value="atm_transact">ATM Transact</SelectItem>
+                  <SelectItem value="manual">Manual</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>Cancel</Button>
+          <Button
+            onClick={() => updateAtm.mutate({ id: atm.id, data: form as any })}
+            disabled={updateAtm.isPending}
+          >
+            {updateAtm.isPending ? "Saving..." : "Save Changes"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 const emptyForm: CreateAtmBody = {
   name: "", locationName: "", address: "", city: "", state: "", latitude: undefined, longitude: undefined,
   portalSource: "columbus_data", cashCapacity: 10000, currentBalance: 0, lowCashThreshold: 2000,
@@ -317,6 +408,8 @@ export default function ATMFleet() {
   const [selected, setSelected] = useState<Atm | null>(null);
   const [showAdd, setShowAdd] = useState(false);
   const [showImport, setShowImport] = useState(false);
+  const [editAtm, setEditAtm] = useState<Atm | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<Atm | null>(null);
   const [form, setForm] = useState<CreateAtmBody>(emptyForm);
 
   const { data: atms = [], refetch, isLoading } = useListAtms({
@@ -325,7 +418,7 @@ export default function ATMFleet() {
     portal: portalFilter !== "all" ? portalFilter : undefined,
   });
   const createAtm = useCreateAtm({ mutation: { onSuccess: () => { refetch(); setShowAdd(false); setForm(emptyForm); toast({ title: "ATM added" }); } } });
-  const deleteAtm = useDeleteAtm({ mutation: { onSuccess: () => { refetch(); toast({ title: "ATM removed" }); } } });
+  const deleteAtm = useDeleteAtm({ mutation: { onSuccess: () => { refetch(); setDeleteTarget(null); toast({ title: "ATM removed" }); } } });
 
   const online = atms.filter(a => a.status === "online").length;
   const lowCash = atms.filter(a => a.status === "low_cash").length;
@@ -395,9 +488,9 @@ export default function ATMFleet() {
         <div className="border rounded-lg divide-y bg-card">
           {atms.length === 0 && <div className="py-12 text-center text-muted-foreground">No ATMs found</div>}
           {atms.map(atm => (
-            <div key={atm.id} className="flex items-center gap-4 p-4 hover:bg-muted/30 cursor-pointer transition-colors" onClick={() => setSelected(atm)}>
+            <div key={atm.id} className="flex items-center gap-4 p-4 hover:bg-muted/30 transition-colors group">
               <MapPin className="w-4 h-4 text-muted-foreground flex-shrink-0" />
-              <div className="flex-1 min-w-0">
+              <div className="flex-1 min-w-0 cursor-pointer" onClick={() => setSelected(atm)}>
                 <div className="flex items-center gap-2">
                   <p className="font-medium text-sm truncate">{atm.name}</p>
                   {statusBadge(atm.status)}
@@ -405,12 +498,19 @@ export default function ATMFleet() {
                 <p className="text-xs text-muted-foreground truncate">{atm.address}, {atm.city}, {atm.state}</p>
                 <BalanceBar balance={atm.currentBalance} capacity={atm.cashCapacity} status={atm.status} />
               </div>
-              <div className="text-right flex-shrink-0">
+              <div className="text-right flex-shrink-0 cursor-pointer" onClick={() => setSelected(atm)}>
                 <p className="font-semibold text-sm">${atm.currentBalance.toLocaleString()}</p>
                 <p className="text-xs text-muted-foreground">${atm.cashCapacity.toLocaleString()} cap</p>
                 <p className="text-xs text-muted-foreground capitalize">{atm.portalSource?.replace(/_/g, " ")}</p>
               </div>
-              <ChevronRight className="w-4 h-4 text-muted-foreground" />
+              <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0">
+                <Button variant="ghost" size="sm" className="h-8 w-8 p-0" onClick={() => setEditAtm(atm)}>
+                  <Pencil className="w-3.5 h-3.5" />
+                </Button>
+                <Button variant="ghost" size="sm" className="h-8 w-8 p-0 text-red-500 hover:text-red-600 hover:bg-red-500/10" onClick={() => setDeleteTarget(atm)}>
+                  <Trash2 className="w-3.5 h-3.5" />
+                </Button>
+              </div>
             </div>
           ))}
         </div>
@@ -418,6 +518,27 @@ export default function ATMFleet() {
 
       {/* Detail Sheet */}
       <ATMDetailSheet atm={selected} open={!!selected} onClose={() => setSelected(null)} />
+
+      {/* Edit Dialog */}
+      <EditDialog atm={editAtm} onClose={() => setEditAtm(null)} onSaved={refetch} />
+
+      {/* Delete Confirmation */}
+      <Dialog open={!!deleteTarget} onOpenChange={() => setDeleteTarget(null)}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Remove ATM?</DialogTitle>
+          </DialogHeader>
+          <p className="text-sm text-muted-foreground">
+            This will permanently remove <span className="font-medium text-foreground">{deleteTarget?.name}</span> from your fleet. This cannot be undone.
+          </p>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDeleteTarget(null)}>Cancel</Button>
+            <Button variant="destructive" onClick={() => deleteTarget && deleteAtm.mutate({ id: deleteTarget.id })} disabled={deleteAtm.isPending}>
+              {deleteAtm.isPending ? "Removing..." : "Remove ATM"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* Import Dialog */}
       <ImportDialog open={showImport} onClose={() => setShowImport(false)} onSuccess={() => { refetch(); setShowImport(false); }} />
