@@ -422,21 +422,3 @@ resource "aws_eip" "app" {
   }
 }
 
-# ---------------------------------------------------------------------------
-# Outputs
-# ---------------------------------------------------------------------------
-
-output "ec2_public_ip" {
-  description = "Elastic IP of the EC2 instance — use this as EC2_HOST in GitHub secrets"
-  value       = aws_eip.app.public_ip
-}
-
-output "app_url" {
-  description = "Public HTTPS URL of the application"
-  value       = "https://${var.domain_name}"
-}
-
-output "alb_dns" {
-  description = "ALB DNS name"
-  value       = aws_lb.app.dns_name
-}

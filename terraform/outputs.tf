@@ -9,13 +9,13 @@ output "alb_dns_name" {
 }
 
 output "ec2_public_ip" {
-  description = "EC2 instance public IP address"
-  value       = aws_instance.app.public_ip
+  description = "Elastic IP of the EC2 instance — stable across redeploys. Use as EC2_HOST in GitHub secrets."
+  value       = aws_eip.app.public_ip
 }
 
 output "ssh_command" {
   description = "SSH command to connect to the instance"
-  value       = "ssh -i ~/.ssh/${var.key_pair_name}.pem ubuntu@${aws_instance.app.public_ip}"
+  value       = "ssh -i /Users/aziz/Downloads/replit.pem ubuntu@${aws_eip.app.public_ip}"
 }
 
 output "rds_endpoint" {
