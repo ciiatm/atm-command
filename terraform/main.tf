@@ -259,45 +259,43 @@ resource "aws_instance" "app" {
     ./build.sh
 
     echo "==> [6/7] Writing env file and pushing DB schema..."
-    cat > /opt/atm-command/.env << 'ENVEOF'
-DATABASE_URL=${local.database_url}
-PORT=${var.app_port}
-NODE_ENV=production
-ENVEOF
+    printf 'DATABASE_URL=%s\nPORT=%s\nNODE_ENV=production\n' \
+      "${local.database_url}" \
+      "${var.app_port}" \
+      > /opt/atm-command/.env
 
     export DATABASE_URL="${local.database_url}"
     export PORT="${var.app_port}"
     export NODE_ENV="production"
 
-    # Retry up to 5x - RDS may need a moment after Terraform reports it ready
     for i in 1 2 3 4 5; do
       echo "DB schema push attempt $i/5..."
       pnpm --filter @workspace/db run push-force < /dev/null && break || true
-      [ "$i" -eq 5 ] && echo "WARNING: DB push failed after 5 attempts, server will still start" || sleep 15
+      [ "$i" -eq 5 ] && echo "WARNING: DB push failed after 5 attempts, continuing..." || sleep 15
     done
 
     echo "==> [7/7] Creating systemd service and starting app..."
     NODE_BIN=$(which node)
 
-    cat > /etc/systemd/system/atm-command.service << SVCEOF
-[Unit]
-Description=ATM Command Node.js Server
-After=network.target
-
-[Service]
-Type=simple
-User=ubuntu
-WorkingDirectory=/opt/atm-command
-ExecStart=$NODE_BIN --enable-source-maps /opt/atm-command/artifacts/api-server/dist/index.mjs
-Restart=always
-RestartSec=5
-Environment=NODE_ENV=production
-Environment=PORT=${var.app_port}
-Environment=DATABASE_URL=${local.database_url}
-
-[Install]
-WantedBy=multi-user.target
-SVCEOF
+    printf '%s\n' \
+      '[Unit]' \
+      'Description=ATM Command Node.js Server' \
+      'After=network.target' \
+      '' \
+      '[Service]' \
+      'Type=simple' \
+      'User=ubuntu' \
+      'WorkingDirectory=/opt/atm-command' \
+      "ExecStart=$NODE_BIN --enable-source-maps /opt/atm-command/artifacts/api-server/dist/index.mjs" \
+      'Restart=always' \
+      'RestartSec=5' \
+      'Environment=NODE_ENV=production' \
+      "Environment=PORT=${var.app_port}" \
+      "Environment=DATABASE_URL=${local.database_url}" \
+      '' \
+      '[Install]' \
+      'WantedBy=multi-user.target' \
+      > /etc/systemd/system/atm-command.service
 
     systemctl daemon-reload
     systemctl enable atm-command
