@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export CI=true
 
 echo "==> Installing dependencies..."
 pnpm install --no-frozen-lockfile
