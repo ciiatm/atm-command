@@ -220,7 +220,7 @@ resource "aws_db_instance" "postgres" {
 # ---------------------------------------------------------------------------
 
 locals {
-  database_url = "postgresql://${var.db_username}:${var.db_password}@${aws_db_instance.postgres.endpoint}/${var.db_name}"
+  database_url = "postgresql://${var.db_username}:${var.db_password}@${aws_db_instance.postgres.endpoint}/${var.db_name}?sslmode=no-verify"
 }
 
 resource "aws_instance" "app" {
