@@ -383,7 +383,16 @@ function EditDialog({ atm, onClose, onSaved }: { atm: Atm | null; onClose: () =>
         <DialogFooter>
           <Button variant="outline" onClick={onClose}>Cancel</Button>
           <Button
-            onClick={() => updateAtm.mutate({ id: atm.id, data: form as any })}
+            onClick={() => {
+              // Only send fields the UpdateAtmBody schema accepts; convert null → undefined
+              const payload: any = {};
+              const allowed = ["name","locationName","address","city","state","serialNumber","cashCapacity","lowCashThreshold","status","latitude","longitude"] as const;
+              for (const key of allowed) {
+                const val = (f as any)[key];
+                if (val !== null && val !== undefined) payload[key] = val;
+              }
+              updateAtm.mutate({ id: atm.id, data: payload });
+            }}
             disabled={updateAtm.isPending}
           >
             {updateAtm.isPending ? "Saving..." : "Save Changes"}
