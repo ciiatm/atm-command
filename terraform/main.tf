@@ -238,8 +238,7 @@ resource "aws_instance" "app" {
   user_data = <<-USERDATA
     #!/usr/bin/env bash
     set -euo pipefail
-    # Write to both our log file and cloud-init's output log so it shows in the AWS console
-    exec > >(tee /var/log/atm-command-setup.log) 2>&1
+    exec > /var/log/atm-command-setup.log 2>&1
 
     echo "==> [1/7] Installing system packages..."
     apt-get update -y
