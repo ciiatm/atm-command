@@ -259,27 +259,47 @@ resource "aws_instance" "app" {
     ./build.sh
 
     # --- Write environment file ---
-    cat > /opt/atm-command/.env << 'EOF'
+    cat > /opt/atm-command/.env << 'ENVEOF'
 DATABASE_URL=${local.database_url}
 PORT=${var.app_port}
 NODE_ENV=production
-EOF
+ENVEOF
 
-    # --- Push DB schema ---
+    # --- Push DB schema (retry up to 5x to handle RDS not ready yet) ---
     set -a && source /opt/atm-command/.env && set +a
-    pnpm --filter @workspace/db run push
+    for i in 1 2 3 4 5; do
+      echo "DB schema push attempt $i..."
+      pnpm --filter @workspace/db run push-force && break
+      echo "Attempt $i failed, waiting 15s..."
+      sleep 15
+    done
 
-    # --- Start with PM2 as the ubuntu user ---
-    sudo -u ubuntu bash -c "
-      set -a && source /opt/atm-command/.env && set +a
-      pm2 start \
-        --name atm-command \
-        'node --enable-source-maps /opt/atm-command/artifacts/api-server/dist/index.mjs'
-      pm2 save
-      pm2 startup systemd -u ubuntu --hp /home/ubuntu | tail -1 | bash
-    "
+    # --- Write PM2 ecosystem file with env vars baked in ---
+    cat > /opt/atm-command/ecosystem.config.cjs << 'ECOEOF'
+module.exports = {
+  apps: [{
+    name: "atm-command",
+    script: "node",
+    args: "--enable-source-maps /opt/atm-command/artifacts/api-server/dist/index.mjs",
+    env: {
+      NODE_ENV: "production",
+      PORT: "${var.app_port}",
+      DATABASE_URL: "${local.database_url}"
+    },
+    restart_delay: 5000,
+    max_restarts: 10
+  }]
+};
+ECOEOF
 
+    # --- Register PM2 startup as root, then start as ubuntu ---
+    pm2 startup systemd -u ubuntu --hp /home/ubuntu
     systemctl enable pm2-ubuntu || true
+
+    sudo -u ubuntu bash -c "
+      pm2 start /opt/atm-command/ecosystem.config.cjs
+      pm2 save
+    "
 
     echo "ATM Command deployed successfully"
   USERDATA
