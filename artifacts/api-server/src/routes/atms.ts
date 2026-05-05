@@ -7,7 +7,6 @@ import {
   fillOrdersTable,
 } from "@workspace/db";
 import { eq, desc, gte, and } from "drizzle-orm";
-import { z } from "zod";
 import {
   ListAtmsQueryParams,
   CreateAtmBody,
@@ -154,28 +153,25 @@ router.get("/atms/:id/transactions", async (req, res) => {
 // Bulk import from Excel (parsed client-side, sent as JSON)
 // ---------------------------------------------------------------------------
 
-const ImportAtmRow = z.object({
-  portalAtmId: z.string().optional(),
-  name: z.string(),
-  locationName: z.string(),
-  address: z.string(),
-  city: z.string(),
-  state: z.string(),
-});
-
-const ImportAtmsBody = z.object({
-  rows: z.array(ImportAtmRow),
-  skipExisting: z.boolean().optional().default(true),
-});
+interface ImportAtmRow {
+  portalAtmId?: string;
+  name: string;
+  locationName: string;
+  address: string;
+  city: string;
+  state: string;
+}
 
 router.post("/atms/import", async (req, res) => {
-  const body = ImportAtmsBody.safeParse(req.body);
-  if (!body.success) {
-    res.status(400).json({ error: body.error.issues });
+  const { rows, skipExisting = true } = req.body as {
+    rows: ImportAtmRow[];
+    skipExisting?: boolean;
+  };
+
+  if (!Array.isArray(rows)) {
+    res.status(400).json({ error: "rows must be an array" });
     return;
   }
-
-  const { rows, skipExisting } = body.data;
   let imported = 0;
   let skipped = 0;
 
