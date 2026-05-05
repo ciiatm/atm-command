@@ -16,7 +16,6 @@ provider "aws" {
 # Data sources
 # ---------------------------------------------------------------------------
 
-# Latest Ubuntu 22.04 LTS AMI (Canonical official)
 data "aws_ami" "ubuntu" {
   most_recent = true
   owners      = ["099720109477"] # Canonical
@@ -32,7 +31,6 @@ data "aws_ami" "ubuntu" {
   }
 }
 
-# Default VPC and its subnets (no custom networking required)
 data "aws_vpc" "default" {
   default = true
 }
@@ -48,6 +46,41 @@ data "aws_subnets" "default" {
 # Security groups
 # ---------------------------------------------------------------------------
 
+# ALB: accepts public HTTP/HTTPS traffic
+resource "aws_security_group" "alb" {
+  name        = "${var.app_name}-alb-sg"
+  description = "ATM Command load balancer — public HTTP/HTTPS"
+  vpc_id      = data.aws_vpc.default.id
+
+  ingress {
+    description = "HTTP"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "HTTPS"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "${var.app_name}-alb-sg"
+  }
+}
+
+# EC2: accepts app traffic only from the ALB, plus SSH from allowed CIDR
 resource "aws_security_group" "app" {
   name        = "${var.app_name}-app-sg"
   description = "ATM Command application server"
@@ -62,19 +95,11 @@ resource "aws_security_group" "app" {
   }
 
   ingress {
-    description = "App port"
-    from_port   = var.app_port
-    to_port     = var.app_port
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  ingress {
-    description = "HTTP (optional, for reverse proxy)"
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    description     = "App port from ALB only"
+    from_port       = var.app_port
+    to_port         = var.app_port
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
   }
 
   egress {
@@ -89,6 +114,7 @@ resource "aws_security_group" "app" {
   }
 }
 
+# RDS: accepts Postgres only from the EC2 app server
 resource "aws_security_group" "rds" {
   name        = "${var.app_name}-rds-sg"
   description = "ATM Command RDS PostgreSQL"
@@ -112,6 +138,45 @@ resource "aws_security_group" "rds" {
   tags = {
     Name = "${var.app_name}-rds-sg"
   }
+}
+
+# ---------------------------------------------------------------------------
+# ACM certificate (DNS-validated via Route 53)
+# ---------------------------------------------------------------------------
+
+resource "aws_acm_certificate" "app" {
+  domain_name       = var.domain_name
+  validation_method = "DNS"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  tags = {
+    Name = "${var.app_name}-cert"
+  }
+}
+
+resource "aws_route53_record" "cert_validation" {
+  for_each = {
+    for dvo in aws_acm_certificate.app.domain_validation_options : dvo.domain_name => {
+      name   = dvo.resource_record_name
+      record = dvo.resource_record_value
+      type   = dvo.resource_record_type
+    }
+  }
+
+  zone_id         = var.route53_zone_id
+  name            = each.value.name
+  type            = each.value.type
+  records         = [each.value.record]
+  ttl             = 60
+  allow_overwrite = true
+}
+
+resource "aws_acm_certificate_validation" "app" {
+  certificate_arn         = aws_acm_certificate.app.arn
+  validation_record_fqdns = [for r in aws_route53_record.cert_validation : r.fqdn]
 }
 
 # ---------------------------------------------------------------------------
@@ -183,37 +248,38 @@ resource "aws_instance" "app" {
     curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
     apt-get install -y nodejs
 
-    # --- pnpm ---
+    # --- pnpm + PM2 ---
     npm install -g pnpm pm2
 
     # --- Clone the repo ---
     git clone --branch ${var.github_branch} ${var.github_repo_url} /opt/atm-command
     cd /opt/atm-command
 
-    # --- Build ---
+    # --- Build frontend + backend ---
     ./build.sh
 
     # --- Write environment file ---
-    cat > /opt/atm-command/.env <<EOF
-    DATABASE_URL=${local.database_url}
-    PORT=${var.app_port}
-    NODE_ENV=production
-    EOF
+    cat > /opt/atm-command/.env << 'EOF'
+DATABASE_URL=${local.database_url}
+PORT=${var.app_port}
+NODE_ENV=production
+EOF
 
     # --- Push DB schema ---
     set -a && source /opt/atm-command/.env && set +a
     pnpm --filter @workspace/db run push
 
-    # --- Start with PM2 ---
-    pm2 start \
-      --name atm-command \
-      --env production \
-      "node --enable-source-maps /opt/atm-command/artifacts/api-server/dist/index.mjs"
-    pm2 save
+    # --- Start with PM2 as the ubuntu user ---
+    sudo -u ubuntu bash -c "
+      set -a && source /opt/atm-command/.env && set +a
+      pm2 start \
+        --name atm-command \
+        'node --enable-source-maps /opt/atm-command/artifacts/api-server/dist/index.mjs'
+      pm2 save
+      pm2 startup systemd -u ubuntu --hp /home/ubuntu | tail -1 | bash
+    "
 
-    # --- PM2 on boot ---
-    env PATH=$PATH:/usr/bin pm2 startup systemd -u ubuntu --hp /home/ubuntu
-    systemctl enable pm2-ubuntu
+    systemctl enable pm2-ubuntu || true
 
     echo "ATM Command deployed successfully"
   USERDATA
@@ -223,4 +289,93 @@ resource "aws_instance" "app" {
   }
 
   depends_on = [aws_db_instance.postgres]
+}
+
+# ---------------------------------------------------------------------------
+# Application Load Balancer
+# ---------------------------------------------------------------------------
+
+resource "aws_lb" "app" {
+  name               = "${var.app_name}-alb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb.id]
+  subnets            = data.aws_subnets.default.ids
+
+  tags = {
+    Name = "${var.app_name}-alb"
+  }
+}
+
+resource "aws_lb_target_group" "app" {
+  name     = "${var.app_name}-tg"
+  port     = var.app_port
+  protocol = "HTTP"
+  vpc_id   = data.aws_vpc.default.id
+
+  health_check {
+    path                = "/api/healthz"
+    protocol            = "HTTP"
+    matcher             = "200"
+    interval            = 30
+    timeout             = 5
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+  }
+
+  tags = {
+    Name = "${var.app_name}-tg"
+  }
+}
+
+resource "aws_lb_target_group_attachment" "app" {
+  target_group_arn = aws_lb_target_group.app.arn
+  target_id        = aws_instance.app.id
+  port             = var.app_port
+}
+
+# HTTP → HTTPS redirect
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.app.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type = "redirect"
+    redirect {
+      port        = "443"
+      protocol    = "HTTPS"
+      status_code = "HTTP_301"
+    }
+  }
+}
+
+# HTTPS listener — terminates TLS, forwards to EC2
+resource "aws_lb_listener" "https" {
+  load_balancer_arn = aws_lb.app.arn
+  port              = 443
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  certificate_arn   = aws_acm_certificate_validation.app.certificate_arn
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.app.arn
+  }
+}
+
+# ---------------------------------------------------------------------------
+# Route 53 — point your domain at the ALB
+# ---------------------------------------------------------------------------
+
+resource "aws_route53_record" "app" {
+  zone_id = var.route53_zone_id
+  name    = var.domain_name
+  type    = "A"
+
+  alias {
+    name                   = aws_lb.app.dns_name
+    zone_id                = aws_lb.app.zone_id
+    evaluate_target_health = true
+  }
 }

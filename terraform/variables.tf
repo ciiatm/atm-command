@@ -57,13 +57,23 @@ variable "db_instance_class" {
 }
 
 variable "app_port" {
-  description = "Port the Node.js server listens on"
+  description = "Internal port the Node.js server listens on (not exposed publicly — traffic comes through the ALB)"
   type        = number
   default     = 3000
 }
 
 variable "allowed_ssh_cidr" {
-  description = "CIDR block allowed to SSH into the EC2 instance"
+  description = "CIDR block allowed to SSH into the EC2 instance. Restrict to your IP in production."
   type        = string
   default     = "0.0.0.0/0"
+}
+
+variable "domain_name" {
+  description = "Fully-qualified domain name for the app (e.g. atm.yourcompany.com). Must be in the Route 53 zone below."
+  type        = string
+}
+
+variable "route53_zone_id" {
+  description = "Route 53 hosted zone ID that owns domain_name. Used for ACM DNS validation and the ALB alias record."
+  type        = string
 }
