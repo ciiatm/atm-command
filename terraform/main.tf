@@ -49,7 +49,7 @@ data "aws_subnets" "default" {
 # ALB: accepts public HTTP/HTTPS traffic
 resource "aws_security_group" "alb" {
   name        = "${var.app_name}-alb-sg"
-  description = "ATM Command load balancer — public HTTP/HTTPS"
+  description = "ATM Command load balancer - public HTTP/HTTPS"
   vpc_id      = data.aws_vpc.default.id
 
   ingress {
@@ -83,7 +83,7 @@ resource "aws_security_group" "alb" {
 # EC2: accepts app traffic only from the ALB, plus SSH from allowed CIDR
 resource "aws_security_group" "app" {
   name        = "${var.app_name}-app-sg"
-  description = "ATM Command application server"
+  description = "ATM Command app server - accepts traffic from ALB and SSH"
   vpc_id      = data.aws_vpc.default.id
 
   ingress {
@@ -117,7 +117,7 @@ resource "aws_security_group" "app" {
 # RDS: accepts Postgres only from the EC2 app server
 resource "aws_security_group" "rds" {
   name        = "${var.app_name}-rds-sg"
-  description = "ATM Command RDS PostgreSQL"
+  description = "ATM Command RDS PostgreSQL - accessible from app server only"
   vpc_id      = data.aws_vpc.default.id
 
   ingress {
