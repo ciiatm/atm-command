@@ -1,0 +1,87 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: latest
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build backend
+        run: pnpm --filter @workspace/api-server run build
+
+      - name: Build frontend
+        run: BASE_PATH=/ PORT=3001 pnpm --filter @workspace/atm-dashboard run build
+
+      - name: Copy frontend into server dist
+        run: |
+          mkdir -p artifacts/api-server/dist/public
+          cp -r artifacts/atm-dashboard/dist/public/. artifacts/api-server/dist/public/
+
+      - name: Deploy to EC2 via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -euo pipefail
+
+            cd /opt/atm-command
+
+            echo "==> Pulling latest code..."
+            git pull origin main
+
+            echo "==> Installing dependencies..."
+            pnpm install --frozen-lockfile
+
+            echo "==> Building backend..."
+            pnpm --filter @workspace/api-server run build
+
+            echo "==> Building frontend..."
+            BASE_PATH=/ PORT=3001 pnpm --filter @workspace/atm-dashboard run build
+
+            echo "==> Copying frontend into server dist..."
+            mkdir -p artifacts/api-server/dist/public
+            cp -r artifacts/atm-dashboard/dist/public/. artifacts/api-server/dist/public/
+
+            echo "==> Pushing DB schema..."
+            set -a && source /opt/atm-command/.env && set +a
+            pnpm --filter @workspace/db run push
+
+            echo "==> Restarting app..."
+            pm2 restart atm-command
+
+            echo "==> Deploy complete"
+
+      - name: Verify health check
+        run: |
+          echo "Waiting 15 seconds for app to restart..."
+          sleep 15
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://${{ secrets.EC2_HOST }}/api/healthz || echo "000")
+          echo "Health check status: $STATUS"
+          if [ "$STATUS" != "200" ]; then
+            echo "Health check failed (got $STATUS). Check /var/log/atm-command-setup.log on EC2."
+            exit 1
+          fi
+          echo "App is healthy!"
