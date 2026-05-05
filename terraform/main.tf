@@ -258,6 +258,7 @@ resource "aws_instance" "app" {
 
     echo "==> [5/7] Building..."
     ./build.sh
+    chown -R ubuntu:ubuntu /opt/atm-command
 
     echo "==> [6/7] Writing env file and pushing DB schema..."
     printf 'DATABASE_URL=%s\nPORT=%s\nNODE_ENV=production\n' \
