@@ -7,7 +7,7 @@ import {
   fillOrdersTable,
 } from "@workspace/db";
 import { eq, desc, gte, and } from "drizzle-orm";
-import { z } from "zod/v4";
+import { z } from "zod";
 import {
   ListAtmsQueryParams,
   CreateAtmBody,
