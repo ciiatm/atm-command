@@ -238,68 +238,74 @@ resource "aws_instance" "app" {
   user_data = <<-USERDATA
     #!/usr/bin/env bash
     set -euo pipefail
-    exec > /var/log/atm-command-setup.log 2>&1
+    # Write to both our log file and cloud-init's output log so it shows in the AWS console
+    exec > >(tee /var/log/atm-command-setup.log) 2>&1
 
-    # --- System packages ---
+    echo "==> [1/7] Installing system packages..."
     apt-get update -y
     apt-get install -y git curl build-essential
 
-    # --- Node.js 20 ---
+    echo "==> [2/7] Installing Node.js 20..."
     curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
     apt-get install -y nodejs
 
-    # --- pnpm + PM2 ---
-    npm install -g pnpm pm2
+    echo "==> [3/7] Installing pnpm..."
+    npm install -g pnpm
 
-    # --- Clone the repo ---
+    echo "==> [4/7] Cloning repo..."
     git clone --branch ${var.github_branch} ${var.github_repo_url} /opt/atm-command
     cd /opt/atm-command
 
-    # --- Build frontend + backend ---
+    echo "==> [5/7] Building..."
     ./build.sh
 
-    # --- Write environment file ---
+    echo "==> [6/7] Writing env file and pushing DB schema..."
     cat > /opt/atm-command/.env << 'ENVEOF'
 DATABASE_URL=${local.database_url}
 PORT=${var.app_port}
 NODE_ENV=production
 ENVEOF
 
-    # --- Push DB schema (retry up to 5x to handle RDS not ready yet) ---
-    set -a && source /opt/atm-command/.env && set +a
+    export DATABASE_URL="${local.database_url}"
+    export PORT="${var.app_port}"
+    export NODE_ENV="production"
+
+    # Retry up to 5x - RDS may need a moment after Terraform reports it ready
     for i in 1 2 3 4 5; do
-      echo "DB schema push attempt $i..."
-      pnpm --filter @workspace/db run push-force && break
-      echo "Attempt $i failed, waiting 15s..."
-      sleep 15
+      echo "DB schema push attempt $i/5..."
+      pnpm --filter @workspace/db run push-force < /dev/null && break || true
+      [ "$i" -eq 5 ] && echo "WARNING: DB push failed after 5 attempts, server will still start" || sleep 15
     done
 
-    # --- Write PM2 ecosystem file with env vars baked in ---
-    cat > /opt/atm-command/ecosystem.config.cjs << 'ECOEOF'
-module.exports = {
-  apps: [{
-    name: "atm-command",
-    script: "node",
-    args: "--enable-source-maps /opt/atm-command/artifacts/api-server/dist/index.mjs",
-    env: {
-      NODE_ENV: "production",
-      PORT: "${var.app_port}",
-      DATABASE_URL: "${local.database_url}"
-    },
-    restart_delay: 5000,
-    max_restarts: 10
-  }]
-};
-ECOEOF
+    echo "==> [7/7] Creating systemd service and starting app..."
+    NODE_BIN=$(which node)
 
-    # --- Register PM2 startup as root, then start as ubuntu ---
-    pm2 startup systemd -u ubuntu --hp /home/ubuntu
-    systemctl enable pm2-ubuntu || true
+    cat > /etc/systemd/system/atm-command.service << SVCEOF
+[Unit]
+Description=ATM Command Node.js Server
+After=network.target
 
-    sudo -u ubuntu bash -c "
-      pm2 start /opt/atm-command/ecosystem.config.cjs
-      pm2 save
-    "
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/atm-command
+ExecStart=$NODE_BIN --enable-source-maps /opt/atm-command/artifacts/api-server/dist/index.mjs
+Restart=always
+RestartSec=5
+Environment=NODE_ENV=production
+Environment=PORT=${var.app_port}
+Environment=DATABASE_URL=${local.database_url}
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+    systemctl daemon-reload
+    systemctl enable atm-command
+    systemctl start atm-command
+
+    echo "==> Done. Service status:"
+    systemctl status atm-command --no-pager || true
 
     echo "ATM Command deployed successfully"
   USERDATA
