@@ -253,6 +253,7 @@ resource "aws_instance" "app" {
 
     echo "==> [4/7] Cloning repo..."
     git clone --branch ${var.github_branch} ${var.github_repo_url} /opt/atm-command
+    chown -R ubuntu:ubuntu /opt/atm-command
     cd /opt/atm-command
 
     echo "==> [5/7] Building..."
@@ -300,6 +301,11 @@ resource "aws_instance" "app" {
     systemctl daemon-reload
     systemctl enable atm-command
     systemctl start atm-command
+
+    echo "==> Allowing ubuntu to restart the service without sudo password..."
+    echo "ubuntu ALL=(ALL) NOPASSWD: /bin/systemctl restart atm-command, /bin/systemctl status atm-command" \
+      > /etc/sudoers.d/atm-command
+    chmod 440 /etc/sudoers.d/atm-command
 
     echo "==> Done. Service status:"
     systemctl status atm-command --no-pager || true
@@ -401,4 +407,36 @@ resource "aws_route53_record" "app" {
     zone_id                = aws_lb.app.zone_id
     evaluate_target_health = true
   }
+}
+
+# ---------------------------------------------------------------------------
+# Elastic IP - stable public IP for SSH / GitHub Actions deploys
+# ---------------------------------------------------------------------------
+
+resource "aws_eip" "app" {
+  instance = aws_instance.app.id
+  domain   = "vpc"
+
+  tags = {
+    Name = "${var.app_name}-eip"
+  }
+}
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+
+output "ec2_public_ip" {
+  description = "Elastic IP of the EC2 instance — use this as EC2_HOST in GitHub secrets"
+  value       = aws_eip.app.public_ip
+}
+
+output "app_url" {
+  description = "Public HTTPS URL of the application"
+  value       = "https://${var.domain_name}"
+}
+
+output "alb_dns" {
+  description = "ALB DNS name"
+  value       = aws_lb.app.dns_name
 }
