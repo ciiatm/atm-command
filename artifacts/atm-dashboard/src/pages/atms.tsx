@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useRef, useCallback } from "react";
 import { useListAtms, useCreateAtm, useUpdateAtm, useDeleteAtm, useGetAtmTransactions } from "@workspace/api-client-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -7,10 +7,11 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useToast } from "@/hooks/use-toast";
-import { Search, Plus, RefreshCw, MapPin, Wifi, WifiOff, AlertTriangle, TrendingUp, ChevronRight } from "lucide-react";
+import { Search, Plus, RefreshCw, MapPin, Wifi, WifiOff, AlertTriangle, Upload, ChevronRight, FileSpreadsheet, CheckCircle2, XCircle } from "lucide-react";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 import type { Atm, CreateAtmBody } from "@workspace/api-client-react";
+import * as XLSX from "xlsx";
 
 function statusBadge(status: string) {
   if (status === "online") return <Badge className="bg-emerald-500/15 text-emerald-600 border-emerald-500/30 hover:bg-emerald-500/15"><Wifi className="w-3 h-3 mr-1" />Online</Badge>;
@@ -84,6 +85,224 @@ function ATMDetailSheet({ atm, open, onClose }: { atm: Atm | null; open: boolean
   );
 }
 
+// ---------------------------------------------------------------------------
+// Excel import types
+// ---------------------------------------------------------------------------
+
+interface ImportRow {
+  portalAtmId: string;
+  name: string;
+  locationName: string;
+  address: string;
+  city: string;
+  state: string;
+}
+
+// Parse the specific "Active Terminal List" report format from the XLS
+function parseTerminalSheet(wb: XLSX.WorkBook): ImportRow[] {
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const raw = XLSX.utils.sheet_to_json<any[]>(ws, { header: 1, defval: "" });
+
+  // Find the header row (contains "Terminal ID")
+  const headerRowIdx = raw.findIndex((row: any[]) =>
+    row.some((cell: any) => String(cell).trim() === "Terminal ID")
+  );
+  if (headerRowIdx === -1) throw new Error("Could not find 'Terminal ID' header row");
+
+  const rows: ImportRow[] = [];
+  for (let i = headerRowIdx + 1; i < raw.length; i++) {
+    const row = raw[i] as any[];
+    const terminalId = String(row[0] ?? "").trim();
+    // Stop at summary footer row or empty terminal IDs
+    if (!terminalId || terminalId.startsWith("Active Terminals for:")) break;
+
+    const locationName = String(row[2] ?? "").trim();
+    const address = String(row[3] ?? "").trim();
+    const city = String(row[5] ?? "").trim();
+    const state = String(row[6] ?? "").trim();
+    const machineType = String(row[12] ?? "").trim();
+
+    if (!locationName || !address || !city || !state) continue;
+
+    rows.push({
+      portalAtmId: terminalId,
+      name: machineType || locationName,
+      locationName,
+      address,
+      city,
+      state,
+    });
+  }
+  return rows;
+}
+
+// ---------------------------------------------------------------------------
+// Import dialog
+// ---------------------------------------------------------------------------
+
+function ImportDialog({ open, onClose, onSuccess }: { open: boolean; onClose: () => void; onSuccess: () => void }) {
+  const { toast } = useToast();
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [preview, setPreview] = useState<ImportRow[] | null>(null);
+  const [importing, setImporting] = useState(false);
+  const [result, setResult] = useState<{ imported: number; skipped: number } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const reset = useCallback(() => {
+    setPreview(null);
+    setImporting(false);
+    setResult(null);
+    setError(null);
+    if (fileRef.current) fileRef.current.value = "";
+  }, []);
+
+  const handleClose = () => { reset(); onClose(); };
+
+  const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setError(null);
+    setResult(null);
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const data = ev.target?.result;
+        const wb = XLSX.read(data, { type: "array" });
+        const rows = parseTerminalSheet(wb);
+        if (rows.length === 0) throw new Error("No terminal rows found in this file");
+        setPreview(rows);
+      } catch (err: any) {
+        setError(err.message ?? "Failed to parse file");
+        setPreview(null);
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  };
+
+  const handleImport = async () => {
+    if (!preview) return;
+    setImporting(true);
+    try {
+      const res = await fetch("/api/atms/import", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rows: preview, skipExisting: true }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      setResult(data);
+      onSuccess();
+      toast({ title: `Imported ${data.imported} ATMs`, description: data.skipped ? `${data.skipped} already existed and were skipped` : undefined });
+    } catch (err: any) {
+      setError(err.message ?? "Import failed");
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={handleClose}>
+      <DialogContent className="sm:max-w-2xl max-h-[85vh] flex flex-col">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <FileSpreadsheet className="w-5 h-5 text-emerald-600" />
+            Import ATMs from Excel
+          </DialogTitle>
+          <p className="text-sm text-muted-foreground">
+            Upload your Active Terminal List report (.xls or .xlsx). ATMs with existing Terminal IDs will be skipped.
+          </p>
+        </DialogHeader>
+
+        <div className="flex-1 overflow-y-auto space-y-4 py-2">
+          {/* File picker */}
+          {!result && (
+            <div
+              className="border-2 border-dashed border-muted-foreground/25 rounded-lg p-6 text-center cursor-pointer hover:border-emerald-500/50 hover:bg-emerald-500/5 transition-colors"
+              onClick={() => fileRef.current?.click()}
+            >
+              <Upload className="w-8 h-8 mx-auto text-muted-foreground mb-2" />
+              <p className="text-sm font-medium">{preview ? "Change file" : "Click to choose file"}</p>
+              <p className="text-xs text-muted-foreground mt-1">.xls or .xlsx</p>
+              <input ref={fileRef} type="file" accept=".xls,.xlsx" className="hidden" onChange={handleFile} />
+            </div>
+          )}
+
+          {/* Error */}
+          {error && (
+            <div className="flex items-center gap-2 text-red-600 text-sm bg-red-500/10 rounded-lg p-3">
+              <XCircle className="w-4 h-4 flex-shrink-0" />
+              {error}
+            </div>
+          )}
+
+          {/* Success result */}
+          {result && (
+            <div className="flex items-center gap-3 text-emerald-700 bg-emerald-500/10 rounded-lg p-4">
+              <CheckCircle2 className="w-6 h-6 flex-shrink-0" />
+              <div>
+                <p className="font-medium">{result.imported} ATMs imported successfully</p>
+                {result.skipped > 0 && <p className="text-sm text-muted-foreground">{result.skipped} skipped (already existed)</p>}
+              </div>
+            </div>
+          )}
+
+          {/* Preview table */}
+          {preview && !result && (
+            <div>
+              <p className="text-sm font-medium mb-2">{preview.length} terminals found — preview:</p>
+              <div className="border rounded-lg overflow-hidden">
+                <div className="overflow-x-auto max-h-64">
+                  <table className="w-full text-xs">
+                    <thead className="bg-muted/50 sticky top-0">
+                      <tr>
+                        <th className="text-left px-3 py-2 font-medium">Terminal ID</th>
+                        <th className="text-left px-3 py-2 font-medium">Location</th>
+                        <th className="text-left px-3 py-2 font-medium">Address</th>
+                        <th className="text-left px-3 py-2 font-medium">City</th>
+                        <th className="text-left px-3 py-2 font-medium">ST</th>
+                        <th className="text-left px-3 py-2 font-medium">Machine Type</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y">
+                      {preview.map((row, i) => (
+                        <tr key={i} className="hover:bg-muted/30">
+                          <td className="px-3 py-2 font-mono text-muted-foreground">{row.portalAtmId}</td>
+                          <td className="px-3 py-2 font-medium">{row.locationName}</td>
+                          <td className="px-3 py-2 text-muted-foreground">{row.address}</td>
+                          <td className="px-3 py-2">{row.city}</td>
+                          <td className="px-3 py-2">{row.state}</td>
+                          <td className="px-3 py-2 text-muted-foreground truncate max-w-32">{row.name}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <DialogFooter className="border-t pt-4">
+          {result ? (
+            <Button onClick={handleClose}>Done</Button>
+          ) : (
+            <>
+              <Button variant="outline" onClick={handleClose}>Cancel</Button>
+              <Button
+                onClick={handleImport}
+                disabled={!preview || importing}
+                className="bg-emerald-600 hover:bg-emerald-700"
+              >
+                {importing ? "Importing..." : `Import ${preview?.length ?? 0} ATMs`}
+              </Button>
+            </>
+          )}
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 const emptyForm: CreateAtmBody = {
   name: "", locationName: "", address: "", city: "", state: "", latitude: undefined, longitude: undefined,
   portalSource: "columbus_data", cashCapacity: 10000, currentBalance: 0, lowCashThreshold: 2000,
@@ -97,6 +316,7 @@ export default function ATMFleet() {
   const [portalFilter, setPortalFilter] = useState<string>("all");
   const [selected, setSelected] = useState<Atm | null>(null);
   const [showAdd, setShowAdd] = useState(false);
+  const [showImport, setShowImport] = useState(false);
   const [form, setForm] = useState<CreateAtmBody>(emptyForm);
 
   const { data: atms = [], refetch, isLoading } = useListAtms({
@@ -120,6 +340,7 @@ export default function ATMFleet() {
         </div>
         <div className="flex gap-2">
           <Button variant="outline" size="sm" onClick={() => refetch()}><RefreshCw className="w-4 h-4 mr-1" />Refresh</Button>
+          <Button variant="outline" size="sm" onClick={() => setShowImport(true)}><Upload className="w-4 h-4 mr-1" />Import Excel</Button>
           <Button size="sm" onClick={() => setShowAdd(true)}><Plus className="w-4 h-4 mr-1" />Add ATM</Button>
         </div>
       </div>
@@ -197,6 +418,9 @@ export default function ATMFleet() {
 
       {/* Detail Sheet */}
       <ATMDetailSheet atm={selected} open={!!selected} onClose={() => setSelected(null)} />
+
+      {/* Import Dialog */}
+      <ImportDialog open={showImport} onClose={() => setShowImport(false)} onSuccess={() => { refetch(); setShowImport(false); }} />
 
       {/* Add ATM Dialog */}
       <Dialog open={showAdd} onOpenChange={setShowAdd}>

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 echo "==> Installing dependencies..."
-pnpm install --frozen-lockfile
+pnpm install --no-frozen-lockfile
 
 echo "==> Building backend..."
 pnpm --filter @workspace/api-server run build

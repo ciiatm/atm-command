@@ -6,7 +6,8 @@ import {
   alertsTable,
   fillOrdersTable,
 } from "@workspace/db";
-import { eq, desc, gte, sql, and } from "drizzle-orm";
+import { eq, desc, gte, and } from "drizzle-orm";
+import { z } from "zod/v4";
 import {
   ListAtmsQueryParams,
   CreateAtmBody,
@@ -147,6 +148,68 @@ router.get("/atms/:id/transactions", async (req, res) => {
     .orderBy(desc(atmTransactionsTable.date));
 
   res.json(transactions);
+});
+
+// ---------------------------------------------------------------------------
+// Bulk import from Excel (parsed client-side, sent as JSON)
+// ---------------------------------------------------------------------------
+
+const ImportAtmRow = z.object({
+  portalAtmId: z.string().optional(),
+  name: z.string(),
+  locationName: z.string(),
+  address: z.string(),
+  city: z.string(),
+  state: z.string(),
+});
+
+const ImportAtmsBody = z.object({
+  rows: z.array(ImportAtmRow),
+  skipExisting: z.boolean().optional().default(true),
+});
+
+router.post("/atms/import", async (req, res) => {
+  const body = ImportAtmsBody.safeParse(req.body);
+  if (!body.success) {
+    res.status(400).json({ error: body.error.issues });
+    return;
+  }
+
+  const { rows, skipExisting } = body.data;
+  let imported = 0;
+  let skipped = 0;
+
+  for (const row of rows) {
+    // Skip if an ATM with same portalAtmId already exists
+    if (skipExisting && row.portalAtmId) {
+      const existing = await db
+        .select({ id: atmsTable.id })
+        .from(atmsTable)
+        .where(eq(atmsTable.portalAtmId, row.portalAtmId))
+        .limit(1);
+      if (existing.length > 0) {
+        skipped++;
+        continue;
+      }
+    }
+
+    await db.insert(atmsTable).values({
+      portalAtmId: row.portalAtmId,
+      name: row.name,
+      locationName: row.locationName,
+      address: row.address,
+      city: row.city,
+      state: row.state,
+      portalSource: "manual",
+      cashCapacity: 10000,
+      currentBalance: 0,
+      lowCashThreshold: 2000,
+      status: "unknown",
+    });
+    imported++;
+  }
+
+  res.json({ imported, skipped, total: rows.length });
 });
 
 export default router;
