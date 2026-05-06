@@ -3,42 +3,44 @@
  *
  * Strategy:
  * 1. Login
- * 2. Scrape TerminalStatusReport.aspx grid — terminal IDs, balance, last contact (FAST)
- * 3. Scrape rptTerminalListType report — postal code, property type, and any extra fields
- * 4. Scrape rptActiveTerminals report — location name, address, city, state, make/model, surcharge
- * 5. Merge all three sources by terminal ID and return
- *
- * Steps 3 and 4 both run against ReportViewer.aspx pages (bulk tables, fast).
- * No per-terminal navigation required.
+ * 2. Scrape TerminalStatusReport.aspx grid — terminal IDs, balance, last contact (fast, proven)
+ * 3. Scrape rptTerminalListType — address, surcharge, property type, postal code
+ *    Falls back to rptActiveTerminals if rptTerminalListType returns 0 rows.
+ * 4. Merge and return
  */
 
-import puppeteer, { type Browser, type Page } from "puppeteer";
+import puppeteer, { type Browser, type Page, type Frame } from "puppeteer";
 import { execSync } from "node:child_process";
 import { logger } from "../logger.js";
 
 const LOGIN_URL        = "https://www.columbusdata.net/cdswebtool/login/login.aspx";
-const REPORT_URL       = "https://www.columbusdata.net/cdswebtool/QuickView/TerminalStatusReport.aspx";
-const ACTIVE_TERMS_URL = "https://www.columbusdata.net/cdswebtool/includes/ReportViewer.aspx?reportname=rptActiveTerminals";
+const GRID_URL         = "https://www.columbusdata.net/cdswebtool/QuickView/TerminalStatusReport.aspx";
 const TERM_LIST_URL    = "https://www.columbusdata.net/cdswebtool/includes/ReportViewer.aspx?reportname=rptTerminalListType";
+const ACTIVE_TERMS_URL = "https://www.columbusdata.net/cdswebtool/includes/ReportViewer.aspx?reportname=rptActiveTerminals";
+
+// ---------------------------------------------------------------------------
+// Public interface
+// ---------------------------------------------------------------------------
 
 export interface ColumbusTerminalStatus {
   terminalId: string;
   terminalLabel: string;
-  // From rptActiveTerminals
   locationName: string | null;
   address: string | null;
   city: string | null;
   state: string | null;
-  makeModel: string | null;
-  surcharge: number | null;
-  // From rptTerminalListType
   postalCode: string | null;
   propertyType: string | null;
-  // From TerminalStatusReport grid
+  makeModel: string | null;
+  surcharge: number | null;
   currentBalance: number | null;
   lastContact: string | null;
   isOnline: boolean;
 }
+
+// ---------------------------------------------------------------------------
+// Browser launch
+// ---------------------------------------------------------------------------
 
 function findChromiumExecutable(): string | undefined {
   if (process.env.CHROMIUM_PATH) return process.env.CHROMIUM_PATH;
@@ -51,6 +53,10 @@ function findChromiumExecutable(): string | undefined {
   }
   return undefined;
 }
+
+// ---------------------------------------------------------------------------
+// Main entry point
+// ---------------------------------------------------------------------------
 
 export async function scrapeColumbusData(
   username: string,
@@ -71,9 +77,7 @@ export async function scrapeColumbusData(
     page.setDefaultNavigationTimeout(60_000);
     page.setDefaultTimeout(30_000);
 
-    // ------------------------------------------------------------------
-    // Step 1: Login
-    // ------------------------------------------------------------------
+    // ── 1. Login ──────────────────────────────────────────────────────────
     logger.info("Columbus Data: logging in");
     await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#UsernameTextbox", { visible: true });
@@ -84,27 +88,22 @@ export async function scrapeColumbusData(
       page.click("#LoginButton"),
     ]);
     if (/login/i.test(page.url())) {
-      throw new Error("Columbus Data login failed — still on login page, check credentials");
+      throw new Error("Columbus Data login failed — still on login page");
     }
     logger.info("Columbus Data: login successful");
 
-    // ------------------------------------------------------------------
-    // Step 2: TerminalStatusReport grid — balance, last contact, IDs (FAST)
-    // ------------------------------------------------------------------
-    logger.info("Columbus Data: navigating to terminal status grid");
-    page.goto(REPORT_URL).catch(() => {});
-
+    // ── 2. Status grid — balance, last contact, terminal IDs ─────────────
+    logger.info("Columbus Data: loading status grid");
+    page.goto(GRID_URL).catch(() => {});
     const gridFound = await page
       .waitForSelector("table[id*='rgTermStatusReport']", { timeout: 45_000 })
       .then(() => true).catch(() => false);
 
     if (!gridFound) {
-      const html = await page.evaluate(() => document.body?.innerHTML?.slice(0, 2000) ?? "");
-      logger.warn({ html }, "Columbus Data: grid not found");
-      throw new Error("Columbus Data: status report grid not found after 45s");
+      throw new Error("Columbus Data: status grid not found after 45s");
     }
 
-    // Try to expand page size to get all terminals on one page
+    // Try to expand page size
     try {
       const sizeInput = await page.$("#rgTermStatusReport_ctl00_ctl03_ctl01_PageSizeComboBox_Input");
       if (sizeInput) {
@@ -119,60 +118,47 @@ export async function scrapeColumbusData(
     logger.info({ count: gridRows.length }, "Columbus Data: grid scraped");
 
     if (gridRows.length === 0) {
-      throw new Error("Columbus Data: no terminal rows found in status report grid");
+      throw new Error("Columbus Data: no rows found in status grid");
     }
 
-    // ------------------------------------------------------------------
-    // Step 3: rptTerminalListType — postal code, property type, extra info
-    // ------------------------------------------------------------------
-    const terminalListMap = await scrapeReportTable(page, TERM_LIST_URL, "rptTerminalListType");
-    logger.info({ count: terminalListMap.size }, "Columbus Data: rptTerminalListType scraped");
+    // ── 3. rptTerminalListType — address, surcharge, property type ────────
+    let infoMap = await scrapeReportViewer(page, TERM_LIST_URL, "rptTerminalListType");
 
-    // ------------------------------------------------------------------
-    // Step 4: rptActiveTerminals — location name, address, city, state, make/model, surcharge
-    // ------------------------------------------------------------------
-    const activeTerminalsMap = await scrapeReportTable(page, ACTIVE_TERMS_URL, "rptActiveTerminals");
-    logger.info({ count: activeTerminalsMap.size }, "Columbus Data: rptActiveTerminals scraped");
+    if (infoMap.size === 0) {
+      logger.warn("Columbus Data: rptTerminalListType returned 0 rows — trying rptActiveTerminals");
+      infoMap = await scrapeReportViewer(page, ACTIVE_TERMS_URL, "rptActiveTerminals");
+    }
 
-    // ------------------------------------------------------------------
-    // Step 5: Merge and return
-    // ------------------------------------------------------------------
-    const results: ColumbusTerminalStatus[] = gridRows.map(row => {
-      const active = activeTerminalsMap.get(row.terminalId);
-      const listType = terminalListMap.get(row.terminalId);
+    logger.info({ count: infoMap.size }, "Columbus Data: info report scraped");
 
-      // Prefer terminalListType for postal code / property type;
-      // fall back to activeTerminals if terminalListType didn't have them
-      const postalCode   = listType?.postalCode   ?? active?.postalCode   ?? null;
-      const propertyType = listType?.propertyType ?? active?.propertyType ?? null;
-
-      return {
-        terminalId: row.terminalId,
-        terminalLabel: row.terminalLabel,
-        locationName: active?.locationName ?? listType?.locationName ?? null,
-        address:      active?.address      ?? listType?.address      ?? null,
-        city:         active?.city         ?? listType?.city         ?? null,
-        state:        active?.state        ?? listType?.state        ?? null,
-        makeModel:    active?.makeModel    ?? listType?.makeModel    ?? null,
-        surcharge:    active?.surcharge    ?? listType?.surcharge    ?? null,
-        postalCode,
-        propertyType,
-        currentBalance: row.currentBalance,
-        lastContact:    row.lastContact,
-        isOnline:       row.isOnline,
-      };
-    });
-
-    // Deduplicate by terminal ID
+    // ── 4. Merge ──────────────────────────────────────────────────────────
     const seen = new Set<string>();
-    const deduped = results.filter(r => {
-      if (seen.has(r.terminalId)) return false;
-      seen.add(r.terminalId);
-      return true;
-    });
+    const results: ColumbusTerminalStatus[] = [];
 
-    logger.info({ scraped: results.length, deduped: deduped.length }, "Columbus Data: sync complete");
-    return deduped;
+    for (const row of gridRows) {
+      if (seen.has(row.terminalId)) continue;
+      seen.add(row.terminalId);
+
+      const info = infoMap.get(row.terminalId);
+      results.push({
+        terminalId:    row.terminalId,
+        terminalLabel: row.terminalLabel,
+        locationName:  info?.locationName  ?? null,
+        address:       info?.address       ?? null,
+        city:          info?.city          ?? null,
+        state:         info?.state         ?? null,
+        postalCode:    info?.postalCode    ?? null,
+        propertyType:  info?.propertyType  ?? null,
+        makeModel:     info?.makeModel     ?? null,
+        surcharge:     info?.surcharge     ?? null,
+        currentBalance: row.currentBalance,
+        lastContact:   row.lastContact,
+        isOnline:      row.isOnline,
+      });
+    }
+
+    logger.info({ total: results.length }, "Columbus Data: sync complete");
+    return results;
 
   } finally {
     await browser?.close().catch(() => {});
@@ -180,12 +166,13 @@ export async function scrapeColumbusData(
 }
 
 // ---------------------------------------------------------------------------
-// Generic ReportViewer.aspx table scraper
-// Handles both rptActiveTerminals and rptTerminalListType (same page structure)
-// Returns a Map<terminalId, record> with all columns keyed by lowercase header
+// ReportViewer.aspx scraper
+// Handles rptTerminalListType and rptActiveTerminals.
+// SSRS reports render slowly and often inside iframes — this function
+// polls all frames for up to 30 s and logs everything it finds.
 // ---------------------------------------------------------------------------
 
-interface ReportRow {
+interface InfoRow {
   terminalId: string;
   locationName: string | null;
   address: string | null;
@@ -197,153 +184,183 @@ interface ReportRow {
   surcharge: number | null;
 }
 
-async function scrapeReportTable(
+async function scrapeReportViewer(
   page: Page,
   url: string,
   reportName: string,
-): Promise<Map<string, ReportRow>> {
-  logger.info({ url }, `Columbus Data: scraping ${reportName}`);
+): Promise<Map<string, InfoRow>> {
+  logger.info({ url, reportName }, "Columbus Data: loading report");
 
-  // Proper await navigation — avoids race condition with waitForSelector
   await page.goto(url, { waitUntil: "domcontentloaded" }).catch(() => {});
 
-  // Wait for any table to appear
-  await page.waitForSelector("table", { timeout: 20_000 }).catch(() => {});
+  // Give the page time to start rendering
+  await new Promise(r => setTimeout(r, 2_000));
 
-  // Click a View Report / Submit / Run button if present (needed for ReportViewer.aspx)
+  // Click any "View Report" / "Submit" / "Run" button
   const clicked = await page.evaluate(() => {
-    const btn = Array.from(document.querySelectorAll<HTMLElement>(
-      "input[type=submit], button, input[type=button]"
-    )).find(el => /view|submit|run|generate|get/i.test(
-      (el as HTMLInputElement).value ?? (el as HTMLButtonElement).innerText ?? ""
+    const btn = Array.from(
+      document.querySelectorAll<HTMLElement>("input[type=submit], input[type=button], button")
+    ).find(el => /view|submit|run|generate|report/i.test(
+      (el as HTMLInputElement).value || (el as HTMLButtonElement).textContent || ""
     ));
-    if (btn) { btn.click(); return true; }
-    return false;
-  }).catch(() => false);
+    if (btn) { btn.click(); return (btn as HTMLInputElement).value || (btn as HTMLButtonElement).textContent || "clicked"; }
+    return null;
+  }).catch(() => null);
 
   if (clicked) {
-    // Wait for the report table to reload after clicking
-    await new Promise(r => setTimeout(r, 1_000));
-    await page.waitForSelector("table", { timeout: 25_000 }).catch(() => {});
-    await new Promise(r => setTimeout(r, 1_500));
+    logger.info({ reportName, clicked }, "Columbus Data: clicked submit button");
+    await new Promise(r => setTimeout(r, 3_000));
   }
 
-  // Scrape the table — try main frame then iframes
-  const scrapeTable = async (ctx: Page | import("puppeteer").Frame): Promise<ReportRow[] | null> => {
-    return ctx.evaluate(() => {
-      function cellText(el: Element): string {
-        return (el.textContent ?? "").replace(/\s+/g, " ").trim();
+  // Poll all frames (main + iframes) for up to 30 s
+  const deadline = Date.now() + 30_000;
+  let bestRows: InfoRow[] = [];
+
+  while (Date.now() < deadline) {
+    const allFrames: Frame[] = [page.mainFrame(), ...page.frames().filter(f => f !== page.mainFrame())];
+
+    logger.info({ reportName, frameCount: allFrames.length }, "Columbus Data: scanning frames");
+
+    for (const frame of allFrames) {
+      let frameUrl = "";
+      try { frameUrl = frame.url(); } catch { continue; }
+
+      const rows = await extractTableFromFrame(frame, reportName, frameUrl).catch(() => null);
+
+      if (rows && rows.length > 0) {
+        logger.info({ reportName, frameUrl, rowCount: rows.length, sample: rows[0] }, "Columbus Data: found report rows");
+        if (rows.length > bestRows.length) bestRows = rows;
       }
-      function parseDollar(raw: string): number | null {
-        const n = parseFloat(raw.replace(/[$,\s]/g, ""));
-        return isNaN(n) ? null : n;
-      }
-
-      // Find the largest table that mentions "terminal"
-      const tables = Array.from(document.querySelectorAll("table"));
-      let best: HTMLTableElement | null = null;
-      for (const t of tables) {
-        const text = (t.textContent ?? "").toLowerCase();
-        if (t.rows.length > 3 && (text.includes("terminal") || text.includes("location") || text.includes("property"))) {
-          if (!best || t.rows.length > best.rows.length) best = t;
-        }
-      }
-      if (!best) return null;
-
-      // Find the header row — look for a row with at least 3 th/td headers
-      const allRows = Array.from(best.querySelectorAll("tr"));
-      const headerRow = allRows.find(r => {
-        const t = (r.textContent ?? "").toLowerCase().replace(/\s+/g, "");
-        return t.includes("terminal") && (
-          t.includes("address") || t.includes("location") || t.includes("postal") ||
-          t.includes("property") || t.includes("surcharge") || t.includes("city") ||
-          t.includes("type")
-        );
-      });
-      if (!headerRow) return null;
-
-      const headers = Array.from(headerRow.querySelectorAll("th, td"))
-        .map(h => cellText(h).toLowerCase().replace(/\s+/g, ""));
-
-      function colIdx(keyword: string): number {
-        const k = keyword.toLowerCase().replace(/\s+/g, "");
-        return headers.findIndex(h => h.includes(k));
-      }
-
-      const idxTerminal   = colIdx("terminalid") >= 0 ? colIdx("terminalid") : colIdx("termid") >= 0 ? colIdx("termid") : 0;
-      const idxLocation   = colIdx("locationname") >= 0 ? colIdx("locationname") : colIdx("location") >= 0 ? colIdx("location") : -1;
-      const idxAddress    = colIdx("address");
-      const idxCity       = colIdx("city");
-      const idxState      = colIdx("state") >= 0 ? colIdx("state") : colIdx("province");
-      const idxPostal     = colIdx("postal") >= 0 ? colIdx("postal") : colIdx("zip");
-      const idxPropType   = colIdx("propertytype") >= 0 ? colIdx("propertytype") : colIdx("property") >= 0 ? colIdx("property") : colIdx("type") >= 0 ? colIdx("type") : -1;
-      const idxMakeModel  = colIdx("machinetype") >= 0 ? colIdx("machinetype") : colIdx("makemodel") >= 0 ? colIdx("makemodel") : colIdx("model") >= 0 ? colIdx("model") : colIdx("make") >= 0 ? colIdx("make") : -1;
-      const idxSurcharge  = colIdx("surcharge");
-
-      const result: {
-        terminalId: string;
-        locationName: string | null; address: string | null; city: string | null;
-        state: string | null; postalCode: string | null; propertyType: string | null;
-        makeModel: string | null; surcharge: number | null;
-      }[] = [];
-
-      const headerIdx = allRows.indexOf(headerRow);
-      for (let i = headerIdx + 1; i < allRows.length; i++) {
-        const cells = Array.from(allRows[i].querySelectorAll("td"));
-        if (cells.length < 2) continue;
-
-        const terminalId = cellText(cells[idxTerminal] ?? cells[0]);
-        if (!terminalId || /terminal\s*id|^total|^grand/i.test(terminalId)) continue;
-
-        function getCell(idx: number): string | null {
-          if (idx < 0 || idx >= cells.length) return null;
-          return cellText(cells[idx]) || null;
-        }
-
-        result.push({
-          terminalId,
-          locationName: getCell(idxLocation),
-          address:      getCell(idxAddress),
-          city:         getCell(idxCity),
-          state:        getCell(idxState),
-          postalCode:   getCell(idxPostal),
-          propertyType: getCell(idxPropType),
-          makeModel:    getCell(idxMakeModel),
-          surcharge:    idxSurcharge >= 0 && cells[idxSurcharge] ? parseDollar(cellText(cells[idxSurcharge])) : null,
-        });
-      }
-
-      return result.length > 0 ? result : null;
-    });
-  };
-
-  let rows = await scrapeTable(page).catch(() => null);
-
-  // Try iframes if main frame had no results
-  if (!rows || rows.length === 0) {
-    for (const frame of page.frames()) {
-      if (frame === page.mainFrame()) continue;
-      rows = await scrapeTable(frame as any).catch(() => null);
-      if (rows && rows.length > 0) break;
     }
+
+    if (bestRows.length > 0) break;
+
+    // Not found yet — wait and retry
+    await new Promise(r => setTimeout(r, 3_000));
   }
 
-  logger.info(
-    { report: reportName, count: rows?.length ?? 0, sample: rows?.[0] ?? null },
-    "Columbus Data: report table scraped"
-  );
+  if (bestRows.length === 0) {
+    // Log a diagnostic snippet from the main frame
+    const snippet = await page.evaluate(() => document.body?.innerText?.slice(0, 500) ?? "").catch(() => "");
+    logger.warn({ reportName, bodySnippet: snippet }, "Columbus Data: no rows found in any frame after 30s");
+  }
 
-  const map = new Map<string, ReportRow>();
-  for (const row of rows ?? []) {
-    if (row.terminalId) {
-      map.set(row.terminalId, row);
-    }
+  const map = new Map<string, InfoRow>();
+  for (const row of bestRows) {
+    if (row.terminalId) map.set(row.terminalId, row);
   }
   return map;
 }
 
 // ---------------------------------------------------------------------------
-// TerminalStatusReport.aspx grid — terminal IDs, balance, last contact
+// Table extraction — runs inside a single frame context
+// ---------------------------------------------------------------------------
+
+async function extractTableFromFrame(
+  frame: Frame,
+  reportName: string,
+  frameUrl: string,
+): Promise<InfoRow[] | null> {
+  return frame.evaluate((rn: string, fu: string) => {
+    function cellText(el: Element | null): string {
+      return (el?.textContent ?? "").replace(/\s+/g, " ").trim();
+    }
+    function parseDollar(raw: string): number | null {
+      const n = parseFloat(raw.replace(/[$,\s]/g, ""));
+      return isNaN(n) ? null : n;
+    }
+
+    // ── Find the best candidate table ─────────────────────────────────────
+    const tables = Array.from(document.querySelectorAll("table"));
+
+    // Score tables: prefer those with "terminal" + at least one address-like keyword
+    let bestTable: HTMLTableElement | null = null;
+    let bestScore = 0;
+
+    for (const t of tables) {
+      if (t.rows.length < 2) continue;
+      const text = (t.textContent ?? "").toLowerCase();
+      let score = 0;
+      if (text.includes("terminal"))  score += 2;
+      if (text.includes("location"))  score += 2;
+      if (text.includes("address"))   score += 3;
+      if (text.includes("surcharge")) score += 2;
+      if (text.includes("postal"))    score += 2;
+      if (text.includes("property"))  score += 2;
+      if (text.includes("city"))      score += 1;
+      if (score > bestScore && t.rows.length > bestScore) {
+        bestScore = score;
+        bestTable = t;
+      }
+    }
+
+    if (!bestTable || bestScore < 3) return null;
+
+    // ── Find the header row ───────────────────────────────────────────────
+    const allRows = Array.from(bestTable.querySelectorAll("tr"));
+    const headerRow = allRows.find(r => {
+      const t = (r.textContent ?? "").toLowerCase().replace(/\s+/g, "");
+      return (t.includes("terminalid") || t.includes("termid")) &&
+             (t.includes("address") || t.includes("location") || t.includes("surcharge") ||
+              t.includes("postal") || t.includes("property") || t.includes("city"));
+    });
+
+    if (!headerRow) return null;
+
+    const headers = Array.from(headerRow.querySelectorAll("th, td"))
+      .map(h => cellText(h).toLowerCase().replace(/\s+/g, ""));
+
+    function col(keyword: string): number {
+      const k = keyword.toLowerCase().replace(/\s+/g, "");
+      const idx = headers.findIndex(h => h.includes(k));
+      return idx;
+    }
+
+    // Map all relevant columns
+    const iTermId     = col("terminalid") >= 0 ? col("terminalid") : col("termid") >= 0 ? col("termid") : 0;
+    const iLocation   = col("locationname") >= 0 ? col("locationname") : col("location") >= 0 ? col("location") : -1;
+    const iAddress    = col("address");
+    const iCity       = col("city");
+    const iState      = col("state") >= 0 ? col("state") : col("province");
+    const iPostal     = col("postal") >= 0 ? col("postal") : col("zip");
+    const iPropType   = col("propertytype") >= 0 ? col("propertytype") : col("property") >= 0 ? col("property") : col("type") >= 0 ? col("type") : -1;
+    const iMakeModel  = col("machinetype") >= 0 ? col("machinetype") : col("makemodel") >= 0 ? col("makemodel") : col("model") >= 0 ? col("model") : col("make") >= 0 ? col("make") : -1;
+    const iSurcharge  = col("surcharge") >= 0 ? col("surcharge") : col("fee") >= 0 ? col("fee") : -1;
+
+    const headerIdx = allRows.indexOf(headerRow);
+    const result: InfoRow[] = [];
+
+    for (let i = headerIdx + 1; i < allRows.length; i++) {
+      const cells = Array.from(allRows[i].querySelectorAll("td"));
+      if (cells.length < 2) continue;
+
+      const terminalId = cellText(cells[iTermId] ?? cells[0]);
+      if (!terminalId || /terminal\s*id|^total|^grand|^sub/i.test(terminalId) || terminalId.length > 20) continue;
+
+      function getCell(idx: number): string | null {
+        if (idx < 0 || idx >= cells.length) return null;
+        return cellText(cells[idx]) || null;
+      }
+
+      result.push({
+        terminalId,
+        locationName: getCell(iLocation),
+        address:      getCell(iAddress),
+        city:         getCell(iCity),
+        state:        getCell(iState),
+        postalCode:   getCell(iPostal),
+        propertyType: getCell(iPropType),
+        makeModel:    getCell(iMakeModel),
+        surcharge:    iSurcharge >= 0 ? parseDollar(cellText(cells[iSurcharge])) : null,
+      });
+    }
+
+    return result.length > 0 ? result : null;
+  }, reportName, frameUrl) as Promise<InfoRow[] | null>;
+}
+
+// ---------------------------------------------------------------------------
+// Status grid scraper — terminal IDs, balance, last contact
 // ---------------------------------------------------------------------------
 
 interface GridRow {
@@ -363,7 +380,7 @@ async function scrapeStatusGrid(page: Page): Promise<GridRow[]> {
 
     const pageRows = await page.evaluate(() => {
       function cellText(cell: Element): string {
-        return (cell.textContent || "").replace(/ /g, " ").trim();
+        return (cell.textContent || "").replace(/\s+/g, " ").trim();
       }
       function parseDollar(raw: string): number | null {
         const n = parseFloat(raw.replace(/[$,\s]/g, ""));
@@ -373,43 +390,32 @@ async function scrapeStatusGrid(page: Page): Promise<GridRow[]> {
       const table = document.querySelector("table[id*='rgTermStatusReport_ctl00']") as HTMLTableElement | null;
       if (!table) return [];
 
-      const result: {
-        terminalId: string; terminalLabel: string; currentBalance: number | null;
-        lastContact: string | null; isOnline: boolean;
-      }[] = [];
-
       const headerRow = table.querySelector("thead tr, tr.rgHeader");
       const headers: string[] = [];
       if (headerRow) {
-        headerRow.querySelectorAll("th, td").forEach(th => {
-          headers.push(cellText(th).toLowerCase());
-        });
+        headerRow.querySelectorAll("th, td").forEach(th => headers.push(cellText(th).toLowerCase()));
       }
 
-      const idxOf = (keyword: string) =>
-        headers.findIndex(h => h.replace(/\s+/g, "").includes(keyword.replace(/\s+/g, "")));
-
+      const idxOf = (kw: string) => headers.findIndex(h => h.replace(/\s+/g, "").includes(kw.replace(/\s+/g, "")));
       const termIdIdx      = idxOf("terminalid") !== -1 ? idxOf("terminalid") : 0;
       const nameIdx        = idxOf("name") !== -1 ? idxOf("name") : 1;
-      const balanceIdx     = idxOf("cashbalance") !== -1 ? idxOf("cashbalance")
-                           : idxOf("balance")    !== -1 ? idxOf("balance") : 3;
+      const balanceIdx     = idxOf("cashbalance") !== -1 ? idxOf("cashbalance") : idxOf("balance") !== -1 ? idxOf("balance") : 3;
       const lastContactIdx = idxOf("lastcommunication") !== -1 ? idxOf("lastcommunication")
                            : idxOf("communication")    !== -1 ? idxOf("communication")
                            : idxOf("lastcontact")      !== -1 ? idxOf("lastcontact") : -1;
 
+      const result: { terminalId: string; terminalLabel: string; currentBalance: number | null; lastContact: string | null; isOnline: boolean }[] = [];
+
       table.querySelectorAll("tr.rgRow, tr.rgAltRow").forEach(tr => {
         const cells = Array.from(tr.querySelectorAll("td"));
         if (cells.length < 2) return;
-
         const terminalId = cellText(cells[termIdIdx] ?? cells[0]);
         if (!terminalId || terminalId === "Terminal ID") return;
 
         const name          = cells[nameIdx] ? cellText(cells[nameIdx]) : "";
         const terminalLabel = name ? `${terminalId} - ${name}` : terminalId;
-        const balanceRaw    = cells[balanceIdx] ? cellText(cells[balanceIdx]) : "";
-        const currentBalance = parseDollar(balanceRaw);
-        const lastContact   = lastContactIdx >= 0 && cells[lastContactIdx]
-          ? cellText(cells[lastContactIdx]) : null;
+        const currentBalance = parseDollar(cells[balanceIdx] ? cellText(cells[balanceIdx]) : "");
+        const lastContact  = lastContactIdx >= 0 && cells[lastContactIdx] ? cellText(cells[lastContactIdx]) : null;
 
         let isOnline = false;
         if (lastContact) {
@@ -424,14 +430,12 @@ async function scrapeStatusGrid(page: Page): Promise<GridRow[]> {
     });
 
     rows.push(...pageRows);
-    logger.info({ pageNum, rowsOnPage: pageRows.length, totalSoFar: rows.length }, "Columbus Data: grid page scraped");
+    logger.info({ pageNum, rowsOnPage: pageRows.length, totalSoFar: rows.length }, "Columbus Data: grid page done");
 
     const hasNext = await page.evaluate(() => {
-      const nextBtn = document.querySelector(
-        "a[title='Next Page'], input[title='Next Page'], .rgPageNext:not(.rgPageNextDisabled)"
-      );
-      if (nextBtn && !(nextBtn as HTMLElement).classList.contains("rgPageNextDisabled")) {
-        (nextBtn as HTMLElement).click();
+      const btn = document.querySelector("a[title='Next Page'], input[title='Next Page'], .rgPageNext:not(.rgPageNextDisabled)");
+      if (btn && !(btn as HTMLElement).classList.contains("rgPageNextDisabled")) {
+        (btn as HTMLElement).click();
         return true;
       }
       return false;
