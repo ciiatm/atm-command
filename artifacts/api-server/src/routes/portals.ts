@@ -55,6 +55,7 @@ router.get("/portals", async (req, res) => {
       url: PORTAL_CONFIG[p.name]?.url ?? "",
       username: p.username,
       isActive: p.isActive,
+      syncIntervalHours: p.syncIntervalHours,
       lastSynced: p.lastSynced,
       lastSyncStatus: p.lastSyncStatus,
       atmCount: countMap[p.name] ?? 0,
@@ -69,13 +70,13 @@ router.post("/portals", async (req, res) => {
     res.status(400).json({ error: body.error.issues });
     return;
   }
-  // Store password as-is (in production would encrypt with a KMS key)
   const [portal] = await db
     .insert(portalsTable)
     .values({
       name: body.data.name as any,
       username: body.data.username,
       passwordEncrypted: body.data.password,
+      syncIntervalHours: (body.data as any).syncIntervalHours ?? 12,
     })
     .returning();
 
@@ -86,6 +87,7 @@ router.post("/portals", async (req, res) => {
     url: PORTAL_CONFIG[portal.name]?.url ?? "",
     username: portal.username,
     isActive: portal.isActive,
+    syncIntervalHours: portal.syncIntervalHours,
     lastSynced: portal.lastSynced,
     lastSyncStatus: portal.lastSyncStatus,
     atmCount: 0,
@@ -105,6 +107,9 @@ router.put("/portals/:id", async (req, res) => {
     if (body.data.username) updateData.username = body.data.username;
     if (body.data.password) updateData.passwordEncrypted = body.data.password;
     if (body.data.isActive !== undefined) updateData.isActive = body.data.isActive;
+  }
+  if ((req.body as any).syncIntervalHours) {
+    updateData.syncIntervalHours = Number((req.body as any).syncIntervalHours);
   }
   const [updated] = await db
     .update(portalsTable)
@@ -127,6 +132,7 @@ router.put("/portals/:id", async (req, res) => {
     url: PORTAL_CONFIG[updated.name]?.url ?? "",
     username: updated.username,
     isActive: updated.isActive,
+    syncIntervalHours: updated.syncIntervalHours,
     lastSynced: updated.lastSynced,
     lastSyncStatus: updated.lastSyncStatus,
     atmCount: Number(atmsCountRow?.cnt ?? 0),

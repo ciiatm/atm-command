@@ -29,6 +29,7 @@ export const portalsTable = pgTable("portals", {
   username: text("username").notNull(),
   passwordEncrypted: text("password_encrypted").notNull(),
   isActive: boolean("is_active").notNull().default(true),
+  syncIntervalHours: integer("sync_interval_hours").notNull().default(12),
   lastSynced: timestamp("last_synced"),
   lastSyncStatus: syncStatusEnum("last_sync_status").notNull().default("never"),
   createdAt: timestamp("created_at").notNull().defaultNow(),

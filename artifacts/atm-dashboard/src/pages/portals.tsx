@@ -7,7 +7,7 @@ import { Label } from "@/components/ui/label";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useToast } from "@/hooks/use-toast";
-import { RefreshCw, Plus, CheckCircle, XCircle, Clock, Server } from "lucide-react";
+import { RefreshCw, Plus, CheckCircle, XCircle, Clock, Server, Zap } from "lucide-react";
 
 function syncStatusBadge(success: boolean | string | null | undefined) {
   if (success === true || success === "success") return <Badge className="bg-emerald-500/15 text-emerald-600 border-emerald-500/30 hover:bg-emerald-500/15"><CheckCircle className="w-3 h-3 mr-1" />Success</Badge>;
@@ -22,8 +22,18 @@ function portalLabel(name: string) {
   return name;
 }
 
-type PortalForm = { name: string; username: string; password: string };
-const emptyPortal: PortalForm = { name: "columbus_data", username: "", password: "" };
+function nextSyncLabel(lastSynced: string | Date | null | undefined, intervalHours: number) {
+  if (!lastSynced) return "Will sync within 30s of next server check";
+  const next = new Date(lastSynced).getTime() + intervalHours * 3_600_000;
+  const diffMs = next - Date.now();
+  if (diffMs <= 0) return "Due now";
+  const h = Math.floor(diffMs / 3_600_000);
+  const m = Math.floor((diffMs % 3_600_000) / 60_000);
+  return h > 0 ? `in ${h}h ${m}m` : `in ${m}m`;
+}
+
+type PortalForm = { name: string; username: string; password: string; syncIntervalHours: number };
+const emptyPortal: PortalForm = { name: "columbus_data", username: "", password: "", syncIntervalHours: 12 };
 
 export default function PortalsPage() {
   const { toast } = useToast();
@@ -89,12 +99,18 @@ export default function PortalsPage() {
                   <Badge variant={portal.isActive ? "default" : "secondary"}>{portal.isActive ? "Active" : "Inactive"}</Badge>
                 </div>
                 <p className="text-sm text-muted-foreground">Username: {portal.username}</p>
-                {portal.lastSynced && (
-                  <p className="text-xs text-muted-foreground mt-0.5">Last synced: {new Date(portal.lastSynced).toLocaleString()}</p>
-                )}
+                <div className="flex items-center gap-3 mt-0.5">
+                  {portal.lastSynced && (
+                    <p className="text-xs text-muted-foreground">Last sync: {new Date(portal.lastSynced).toLocaleString()}</p>
+                  )}
+                  <p className="text-xs text-muted-foreground flex items-center gap-1">
+                    <Zap className="w-3 h-3" />
+                    Auto-sync every {(portal as any).syncIntervalHours ?? 12}h — next {nextSyncLabel(portal.lastSynced, (portal as any).syncIntervalHours ?? 12)}
+                  </p>
+                </div>
               </div>
               <div className="flex gap-2">
-                <Button variant="outline" size="sm" onClick={() => { setForm({ name: portal.name, username: portal.username, password: "" }); setEditingId(portal.id); }}>Edit</Button>
+                <Button variant="outline" size="sm" onClick={() => { setForm({ name: portal.name, username: portal.username, password: "", syncIntervalHours: (portal as any).syncIntervalHours ?? 12 }); setEditingId(portal.id); }}>Edit</Button>
                 <Button size="sm" disabled={syncingId === portal.id} onClick={() => syncPortal.mutate({ id: portal.id })}>
                   <RefreshCw className={`w-4 h-4 mr-1 ${syncingId === portal.id ? "animate-spin" : ""}`} />
                   {syncingId === portal.id ? "Syncing..." : "Sync Now"}
@@ -143,11 +159,23 @@ export default function PortalsPage() {
             </div>
             <div><Label>Username / Email</Label><Input value={form.username} onChange={e => setForm(f => ({ ...f, username: e.target.value }))} placeholder="user@example.com" /></div>
             <div><Label>Password</Label><Input type="password" value={form.password} onChange={e => setForm(f => ({ ...f, password: e.target.value }))} placeholder="Password" /></div>
+            <div>
+              <Label>Auto-sync every</Label>
+              <Select value={String(form.syncIntervalHours)} onValueChange={v => setForm(f => ({ ...f, syncIntervalHours: Number(v) }))}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="4">4 hours</SelectItem>
+                  <SelectItem value="6">6 hours</SelectItem>
+                  <SelectItem value="12">12 hours</SelectItem>
+                  <SelectItem value="24">24 hours</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setShowAdd(false)}>Cancel</Button>
             <Button
-              onClick={() => createPortal.mutate({ data: { name: form.name as any, username: form.username, password: form.password } })}
+              onClick={() => createPortal.mutate({ data: { name: form.name as any, username: form.username, password: form.password, syncIntervalHours: form.syncIntervalHours } as any })}
               disabled={!form.username || !form.password || createPortal.isPending}
             >
               {createPortal.isPending ? "Saving..." : "Save"}
@@ -163,6 +191,18 @@ export default function PortalsPage() {
           <div className="grid gap-3 py-2">
             <div><Label>Username / Email</Label><Input value={form.username} onChange={e => setForm(f => ({ ...f, username: e.target.value }))} /></div>
             <div><Label>New Password</Label><Input type="password" value={form.password} onChange={e => setForm(f => ({ ...f, password: e.target.value }))} placeholder="Leave blank to keep current" /></div>
+            <div>
+              <Label>Auto-sync every</Label>
+              <Select value={String(form.syncIntervalHours)} onValueChange={v => setForm(f => ({ ...f, syncIntervalHours: Number(v) }))}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="4">4 hours</SelectItem>
+                  <SelectItem value="6">6 hours</SelectItem>
+                  <SelectItem value="12">12 hours</SelectItem>
+                  <SelectItem value="24">24 hours</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setEditingId(null)}>Cancel</Button>
@@ -170,7 +210,7 @@ export default function PortalsPage() {
               disabled={updatePortal.isPending}
               onClick={() => {
                 if (editingId !== null) {
-                  updatePortal.mutate({ id: editingId, data: { username: form.username, password: form.password || undefined } });
+                  updatePortal.mutate({ id: editingId, data: { username: form.username, password: form.password || undefined, syncIntervalHours: form.syncIntervalHours } as any });
                 }
               }}
             >
