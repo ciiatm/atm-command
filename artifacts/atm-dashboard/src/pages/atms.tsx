@@ -1,17 +1,39 @@
 import { useState, useRef, useCallback } from "react";
 import { useListAtms, useCreateAtm, useUpdateAtm, useDeleteAtm, useGetAtmTransactions } from "@workspace/api-client-react";
+import { useQuery } from "@tanstack/react-query";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useToast } from "@/hooks/use-toast";
-import { Search, Plus, RefreshCw, MapPin, Wifi, WifiOff, AlertTriangle, Upload, ChevronRight, FileSpreadsheet, CheckCircle2, XCircle, Pencil, Trash2 } from "lucide-react";
+import { Search, Plus, RefreshCw, MapPin, Wifi, WifiOff, AlertTriangle, Upload, FileSpreadsheet, CheckCircle2, XCircle, Pencil, Trash2 } from "lucide-react";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 import type { Atm, CreateAtmBody } from "@workspace/api-client-react";
 import * as XLSX from "xlsx";
+
+interface TransactionLogEntry {
+  id: number;
+  atmId: number;
+  transactedAt: string;
+  cardNumber: string | null;
+  transactionType: string | null;
+  amount: number;
+  response: string | null;
+  terminalBalance: number | null;
+}
+
+function useAtmTransactionLog(atmId: number | undefined) {
+  return useQuery<TransactionLogEntry[]>({
+    queryKey: ["atm-transaction-log", atmId],
+    queryFn: () => fetch(`/api/atms/${atmId}/transaction-log?limit=100`).then(r => r.json()),
+    enabled: !!atmId,
+    staleTime: 30_000,
+  });
+}
 
 function statusBadge(status: string) {
   if (status === "online") return <Badge className="bg-emerald-500/15 text-emerald-600 border-emerald-500/30 hover:bg-emerald-500/15"><Wifi className="w-3 h-3 mr-1" />Online</Badge>;
@@ -34,52 +56,129 @@ function BalanceBar({ balance, capacity, status }: { balance: number; capacity: 
   );
 }
 
+function responseColor(response: string | null) {
+  if (!response) return "text-muted-foreground";
+  const r = response.toLowerCase();
+  if (r.includes("approve") || r.includes("success")) return "text-emerald-600";
+  if (r.includes("decline") || r.includes("fail") || r.includes("error")) return "text-red-500";
+  return "text-muted-foreground";
+}
+
 function ATMDetailSheet({ atm, open, onClose }: { atm: Atm | null; open: boolean; onClose: () => void }) {
   const { data: txData } = useGetAtmTransactions(atm?.id ?? 0, { days: "30" }, { query: { enabled: !!atm } });
+  const { data: txLog = [] } = useAtmTransactionLog(atm?.id);
   const chartData = (txData ?? []).slice(-14).map(t => ({ date: t.date.slice(5), dispensed: t.totalDispensed }));
 
   if (!atm) return null;
   return (
     <Sheet open={open} onOpenChange={onClose}>
-      <SheetContent className="w-full sm:max-w-lg overflow-y-auto">
-        <SheetHeader>
+      <SheetContent className="w-full sm:max-w-2xl overflow-y-auto">
+        <SheetHeader className="mb-4">
           <SheetTitle>{atm.name}</SheetTitle>
           <p className="text-sm text-muted-foreground">{atm.address}, {atm.city}, {atm.state}</p>
         </SheetHeader>
-        <div className="mt-6 space-y-5">
-          <div className="grid grid-cols-2 gap-4">
-            <div className="bg-muted/40 rounded-lg p-3">
-              <p className="text-xs text-muted-foreground">Current Balance</p>
-              <p className="text-xl font-bold">${atm.currentBalance.toLocaleString()}</p>
-              <BalanceBar balance={atm.currentBalance} capacity={atm.cashCapacity} status={atm.status} />
-              <p className="text-xs text-muted-foreground mt-1">{pct(atm.currentBalance, atm.cashCapacity)}% of ${atm.cashCapacity.toLocaleString()}</p>
+
+        <Tabs defaultValue="overview">
+          <TabsList className="mb-4">
+            <TabsTrigger value="overview">Overview</TabsTrigger>
+            <TabsTrigger value="transactions">Transactions {txLog.length > 0 && <span className="ml-1.5 bg-muted text-muted-foreground rounded-full px-1.5 py-0.5 text-[10px] font-medium">{txLog.length}</span>}</TabsTrigger>
+          </TabsList>
+
+          {/* ── Overview tab ── */}
+          <TabsContent value="overview" className="space-y-5 mt-0">
+            {/* Balance + daily volume */}
+            <div className="grid grid-cols-2 gap-4">
+              <div className="bg-muted/40 rounded-lg p-3">
+                <p className="text-xs text-muted-foreground">Current Balance</p>
+                <p className="text-xl font-bold">${atm.currentBalance.toLocaleString()}</p>
+                <BalanceBar balance={atm.currentBalance} capacity={atm.cashCapacity} status={atm.status} />
+                <p className="text-xs text-muted-foreground mt-1">{pct(atm.currentBalance, atm.cashCapacity)}% of ${atm.cashCapacity.toLocaleString()}</p>
+              </div>
+              <div className="bg-muted/40 rounded-lg p-3">
+                <p className="text-xs text-muted-foreground">Daily Volume</p>
+                <p className="text-xl font-bold">${(atm.avgDailyDispensed ?? 0).toLocaleString()}</p>
+                <p className="text-xs text-muted-foreground mt-1">{atm.avgDailyTransactions ?? 0} transactions/day</p>
+              </div>
             </div>
-            <div className="bg-muted/40 rounded-lg p-3">
-              <p className="text-xs text-muted-foreground">Daily Volume</p>
-              <p className="text-xl font-bold">${(atm.avgDailyDispensed ?? 0).toLocaleString()}</p>
-              <p className="text-xs text-muted-foreground mt-1">{atm.avgDailyTransactions ?? 0} transactions/day</p>
+
+            {/* Key fields grid */}
+            <div className="grid grid-cols-2 gap-3 text-sm">
+              <div><span className="text-muted-foreground">Status</span><div className="mt-1">{statusBadge(atm.status)}</div></div>
+              <div><span className="text-muted-foreground">Portal</span><div className="mt-1 font-medium capitalize">{atm.portalSource?.replace(/_/g, " ")}</div></div>
+              <div><span className="text-muted-foreground">Terminal ID</span><div className="mt-1 font-mono text-xs font-medium">{atm.portalAtmId ?? "—"}</div></div>
+              <div><span className="text-muted-foreground">Low Cash Threshold</span><div className="mt-1 font-medium">${atm.lowCashThreshold.toLocaleString()}</div></div>
+              <div><span className="text-muted-foreground">Cash Capacity</span><div className="mt-1 font-medium">${atm.cashCapacity.toLocaleString()}</div></div>
+              <div><span className="text-muted-foreground">Last Synced</span><div className="mt-1 font-medium">{atm.lastSynced ? new Date(atm.lastSynced).toLocaleString() : "Never"}</div></div>
             </div>
-          </div>
-          <div className="grid grid-cols-2 gap-4 text-sm">
-            <div><span className="text-muted-foreground">Status</span><div className="mt-1">{statusBadge(atm.status)}</div></div>
-            <div><span className="text-muted-foreground">Portal</span><div className="mt-1 font-medium capitalize">{atm.portalSource?.replace(/_/g, " ")}</div></div>
-            <div><span className="text-muted-foreground">Threshold</span><div className="mt-1 font-medium">${atm.lowCashThreshold.toLocaleString()}</div></div>
-            <div><span className="text-muted-foreground">Last Synced</span><div className="mt-1 font-medium">{atm.lastSynced ? new Date(atm.lastSynced).toLocaleString() : "Never"}</div></div>
-          </div>
-          {chartData.length > 0 && (
-            <div>
-              <p className="text-sm font-medium mb-2">14-Day Cash Dispensed</p>
-              <ResponsiveContainer width="100%" height={140}>
-                <LineChart data={chartData}>
-                  <XAxis dataKey="date" tick={{ fontSize: 10 }} />
-                  <YAxis tick={{ fontSize: 10 }} tickFormatter={v => `$${(v/1000).toFixed(0)}k`} />
-                  <Tooltip formatter={(v: number) => [`$${v.toLocaleString()}`, "Dispensed"]} />
-                  <Line type="monotone" dataKey="dispensed" stroke="#10b981" strokeWidth={2} dot={false} />
-                </LineChart>
-              </ResponsiveContainer>
-            </div>
-          )}
-        </div>
+
+            {/* 14-day chart */}
+            {chartData.length > 0 && (
+              <div>
+                <p className="text-sm font-medium mb-2">14-Day Cash Dispensed</p>
+                <ResponsiveContainer width="100%" height={140}>
+                  <LineChart data={chartData}>
+                    <XAxis dataKey="date" tick={{ fontSize: 10 }} />
+                    <YAxis tick={{ fontSize: 10 }} tickFormatter={v => `$${(v/1000).toFixed(0)}k`} />
+                    <Tooltip formatter={(v: number) => [`$${v.toLocaleString()}`, "Dispensed"]} />
+                    <Line type="monotone" dataKey="dispensed" stroke="#10b981" strokeWidth={2} dot={false} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            )}
+          </TabsContent>
+
+          {/* ── Transactions tab ── */}
+          <TabsContent value="transactions" className="mt-0">
+            {txLog.length === 0 ? (
+              <div className="py-12 text-center text-muted-foreground text-sm">
+                No transactions found for this terminal.
+                <p className="text-xs mt-1 opacity-60">Sync the portal to pull transaction data.</p>
+              </div>
+            ) : (
+              <div className="border rounded-lg overflow-hidden">
+                <div className="overflow-x-auto max-h-[60vh]">
+                  <table className="w-full text-xs">
+                    <thead className="bg-muted/50 sticky top-0 z-10">
+                      <tr>
+                        <th className="text-left px-3 py-2 font-medium whitespace-nowrap">Date / Time</th>
+                        <th className="text-left px-3 py-2 font-medium">Type</th>
+                        <th className="text-right px-3 py-2 font-medium">Amount</th>
+                        <th className="text-right px-3 py-2 font-medium">Balance After</th>
+                        <th className="text-left px-3 py-2 font-medium">Response</th>
+                        <th className="text-left px-3 py-2 font-medium text-muted-foreground">Card</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y">
+                      {txLog.map(tx => (
+                        <tr key={tx.id} className="hover:bg-muted/20">
+                          <td className="px-3 py-2 font-mono whitespace-nowrap text-muted-foreground">
+                            {new Date(tx.transactedAt).toLocaleString()}
+                          </td>
+                          <td className="px-3 py-2 font-medium">{tx.transactionType ?? "—"}</td>
+                          <td className="px-3 py-2 text-right font-medium">
+                            {tx.amount != null ? `$${tx.amount.toLocaleString()}` : "—"}
+                          </td>
+                          <td className="px-3 py-2 text-right text-muted-foreground">
+                            {tx.terminalBalance != null ? `$${tx.terminalBalance.toLocaleString()}` : "—"}
+                          </td>
+                          <td className={`px-3 py-2 ${responseColor(tx.response)}`}>
+                            {tx.response ?? "—"}
+                          </td>
+                          <td className="px-3 py-2 font-mono text-muted-foreground">
+                            {tx.cardNumber ? `••${tx.cardNumber.slice(-4)}` : "—"}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <div className="px-3 py-2 text-xs text-muted-foreground border-t bg-muted/20">
+                  Showing {txLog.length} most recent transaction{txLog.length !== 1 ? "s" : ""}
+                </div>
+              </div>
+            )}
+          </TabsContent>
+        </Tabs>
       </SheetContent>
     </Sheet>
   );
@@ -405,7 +504,7 @@ function EditDialog({ atm, onClose, onSaved }: { atm: Atm | null; onClose: () =>
 
 const emptyForm: CreateAtmBody = {
   name: "", locationName: "", address: "", city: "", state: "", latitude: undefined, longitude: undefined,
-  portalSource: "columbus_data", cashCapacity: 10000, currentBalance: 0, lowCashThreshold: 2000,
+  portalSource: "columbus_data", cashCapacity: 40000, currentBalance: 0, lowCashThreshold: 2000,
   avgDailyTransactions: undefined, avgDailyDispensed: undefined,
 };
 

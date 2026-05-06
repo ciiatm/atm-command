@@ -266,7 +266,7 @@ async function scrapeStatusReportGrid(page: Page): Promise<GridRow[]> {
         let isOnline = false;
         if (lastContact) {
           const d = new Date(lastContact);
-          if (!isNaN(d.getTime())) isOnline = Date.now() - d.getTime() < 24 * 3600_000;
+          if (!isNaN(d.getTime())) isOnline = Date.now() - d.getTime() < 48 * 3600_000;
         }
 
         result.push({ terminalId, terminalLabel, currentBalance, lastContact, lastError, isOnline });

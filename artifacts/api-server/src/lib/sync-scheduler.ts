@@ -44,7 +44,8 @@ async function syncPortal(portal: {
           .from(atmsTable)
           .where(eq(atmsTable.portalAtmId, ts.terminalId));
 
-        const newBalance = ts.currentBalance ?? (atm?.currentBalance ?? 0);
+        const rawBalance = ts.currentBalance ?? (atm?.currentBalance ?? 0);
+        const newBalance = Math.min(rawBalance, 40_000);
         let newStatus: "online" | "offline" | "error" | "low_cash" | "unknown" = "unknown";
         if (!ts.isOnline) newStatus = "offline";
         else if (newBalance === 0) newStatus = "error";

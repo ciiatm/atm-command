@@ -322,6 +322,7 @@ async function performColumbusDataSync(portal: {
 
       if (!atm) {
         // Auto-create the ATM if it doesn't exist yet
+        const balance = cappedBalance(ts.currentBalance);
         const [newAtm] = await db
           .insert(atmsTable)
           .values({
@@ -332,14 +333,14 @@ async function performColumbusDataSync(portal: {
             state: "Unknown",
             portalSource: "columbus_data",
             portalAtmId: ts.terminalId,
-            currentBalance: ts.currentBalance ?? 0,
-            status: resolveStatus(ts),
+            currentBalance: balance,
+            status: resolveStatus(ts, 2000),
             lastSynced: new Date(),
           })
           .returning();
 
-        if (newAtm && (ts.currentBalance ?? 0) < (newAtm.lowCashThreshold ?? 2000)) {
-          await createBalanceAlert(newAtm.id, newAtm.name, ts.currentBalance ?? 0, newAtm.lowCashThreshold ?? 2000);
+        if (newAtm && balance < (newAtm.lowCashThreshold ?? 2000)) {
+          await createBalanceAlert(newAtm.id, newAtm.name, balance, newAtm.lowCashThreshold ?? 2000);
           alertsCreated++;
         }
 
@@ -350,8 +351,8 @@ async function performColumbusDataSync(portal: {
         continue;
       }
 
-      const newStatus = resolveStatus(ts);
-      const newBalance = ts.currentBalance ?? atm.currentBalance ?? 0;
+      const newBalance = cappedBalance(ts.currentBalance ?? atm.currentBalance);
+      const newStatus = resolveStatus({ ...ts, currentBalance: newBalance }, atm.lowCashThreshold ?? 2000);
 
       await db
         .update(atmsTable)
@@ -393,15 +394,22 @@ async function performColumbusDataSync(portal: {
   }
 }
 
-function resolveStatus(ts: {
-  currentBalance: number | null;
-  isOnline: boolean;
-}): "online" | "offline" | "error" | "low_cash" | "unknown" {
+const MAX_BALANCE = 40_000;
+
+function resolveStatus(
+  ts: { currentBalance: number | null; isOnline: boolean },
+  lowCashThreshold = 2000,
+): "online" | "offline" | "error" | "low_cash" | "unknown" {
   if (!ts.isOnline) return "offline";
   if (ts.currentBalance === null) return "unknown";
   if (ts.currentBalance === 0) return "error";
-  if (ts.currentBalance < 2000) return "low_cash";
+  if (ts.currentBalance < lowCashThreshold) return "low_cash";
   return "online";
+}
+
+function cappedBalance(raw: number | null | undefined): number {
+  if (raw == null) return 0;
+  return Math.min(raw, MAX_BALANCE);
 }
 
 async function createBalanceAlert(

@@ -3,6 +3,7 @@ import { db } from "@workspace/db";
 import {
   atmsTable,
   atmTransactionsTable,
+  atmTransactionLogTable,
   alertsTable,
   fillOrdersTable,
 } from "@workspace/db";
@@ -147,6 +148,25 @@ router.get("/atms/:id/transactions", async (req, res) => {
     .orderBy(desc(atmTransactionsTable.date));
 
   res.json(transactions);
+});
+
+// ---------------------------------------------------------------------------
+// Individual transaction log (scraped from portal Table5)
+// ---------------------------------------------------------------------------
+
+router.get("/atms/:id/transaction-log", async (req, res) => {
+  const id = Number(req.params.id);
+  if (!id) { res.status(400).json({ error: "Invalid id" }); return; }
+  const limit = Math.min(Number(req.query.limit ?? 100), 500);
+
+  const logs = await db
+    .select()
+    .from(atmTransactionLogTable)
+    .where(eq(atmTransactionLogTable.atmId, id))
+    .orderBy(desc(atmTransactionLogTable.transactedAt))
+    .limit(limit);
+
+  res.json(logs);
 });
 
 // ---------------------------------------------------------------------------
