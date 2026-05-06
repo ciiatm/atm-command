@@ -194,7 +194,7 @@ async function setGridPageSize(page: Page, size: number): Promise<void> {
       await el.triple_click?.() ?? await el.click({ clickCount: 3 });
       await el.type(String(size));
       await el.press("Enter");
-      await page.waitForTimeout(3_000); // wait for grid to reload
+      await new Promise(r => setTimeout(r, 3_000)); // wait for grid to reload
       logger.info({ size }, "Columbus Data: set grid page size");
     }
   } catch {
@@ -292,7 +292,7 @@ async function scrapeStatusReportGrid(page: Page): Promise<GridRow[]> {
     });
 
     if (!hasNext || pageRows.length === 0) break;
-    await page.waitForTimeout(2_500);
+    await new Promise(r => setTimeout(r, 2_500));
     pageNum++;
     if (pageNum > 20) break; // safety cap
   }
@@ -331,13 +331,13 @@ async function getTerminalTransactions(
     termLabel,
   );
 
-  await page.waitForTimeout(500);
+  await new Promise(r => setTimeout(r, 500));
 
   // Click Get Status
   const btnGetStatus = await page.$("#btnGetStatus");
   if (btnGetStatus) {
     await btnGetStatus.click();
-    await page.waitForTimeout(3_000);
+    await new Promise(r => setTimeout(r, 3_000));
   }
 
   // Scrape Table5 transactions
