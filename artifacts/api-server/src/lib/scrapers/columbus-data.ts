@@ -41,7 +41,7 @@ function findChromiumExecutable(): string | undefined {
 const LOGIN_URL =
   "https://www.columbusdata.net/cdswebtool/login/login.aspx";
 const STATUS_URL =
-  "https://www.columbusdata.net/cdswebtool/TerminalStatus/CurrentTerminalStatus.aspx";
+  "https://www.columbusdata.net/cdswebtool/TerminalMonitoring/TermIDStatus.aspx";
 
 export interface ColumbusTransaction {
   /** Timestamp string from the portal, e.g. "May 5 2026  9:03AM" */
@@ -191,35 +191,11 @@ export async function scrapeColumbusData(
     }
 
     // -----------------------------------------------------------------------
-    // Step 2: Navigate to Terminal Status page
+    // Step 2: Navigate to Terminal Status page (TermIDStatus.aspx)
     // -----------------------------------------------------------------------
-    if (!currentUrl.includes("CurrentTerminalStatus")) {
-      // Log every link on the main page so we can find the right navigation URL
-      const allLinks = await page.evaluate(() =>
-        Array.from(document.querySelectorAll("a[href]")).map((a) => ({
-          text: (a.textContent || "").trim().slice(0, 60),
-          href: (a as HTMLAnchorElement).href,
-        }))
-      );
-      logger.info({ allLinks }, "Columbus Data: main page links");
-
-      // Find a link whose text or href mentions "Terminal" and "Status"
-      const statusLink = allLinks.find(
-        (l) => /terminal/i.test(l.text) && /status/i.test(l.text)
-      ) ?? allLinks.find(
-        (l) => /terminal/i.test(l.href) && /status/i.test(l.href)
-      ) ?? allLinks.find(
-        (l) => /terminal/i.test(l.text) || /terminal/i.test(l.href)
-      );
-
-      if (!statusLink) {
-        throw new Error(
-          `Columbus Data: could not find Terminal Status link on main page. Links found: ${allLinks.map(l => l.text || l.href).join(", ")}`
-        );
-      }
-
-      logger.info({ statusLink }, "Columbus Data: navigating to terminal status page");
-      page.goto(statusLink.href).catch(() => {}); // fire-and-forget
+    if (!currentUrl.includes("TermIDStatus") && !currentUrl.includes("CurrentTerminalStatus")) {
+      logger.info({ url: STATUS_URL }, "Columbus Data: navigating to terminal status page");
+      page.goto(STATUS_URL).catch(() => {}); // fire-and-forget — page never settles to idle
     }
 
     // -----------------------------------------------------------------------
