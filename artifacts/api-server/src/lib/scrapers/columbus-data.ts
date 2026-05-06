@@ -194,12 +194,32 @@ export async function scrapeColumbusData(
     // Step 2: Navigate to Terminal Status page
     // -----------------------------------------------------------------------
     if (!currentUrl.includes("CurrentTerminalStatus")) {
-      logger.info("Columbus Data: navigating to terminal status page");
-      // Fire-and-forget navigation — don't await the goto itself because the
-      // page never reaches networkidle2 or even domcontentloaded reliably due
-      // to Telerik's persistent XHR connections and slow server redirects.
-      // Instead we wait for the specific element we need.
-      page.goto(STATUS_URL).catch(() => {}); // intentional fire-and-forget
+      // Log every link on the main page so we can find the right navigation URL
+      const allLinks = await page.evaluate(() =>
+        Array.from(document.querySelectorAll("a[href]")).map((a) => ({
+          text: (a.textContent || "").trim().slice(0, 60),
+          href: (a as HTMLAnchorElement).href,
+        }))
+      );
+      logger.info({ allLinks }, "Columbus Data: main page links");
+
+      // Find a link whose text or href mentions "Terminal" and "Status"
+      const statusLink = allLinks.find(
+        (l) => /terminal/i.test(l.text) && /status/i.test(l.text)
+      ) ?? allLinks.find(
+        (l) => /terminal/i.test(l.href) && /status/i.test(l.href)
+      ) ?? allLinks.find(
+        (l) => /terminal/i.test(l.text) || /terminal/i.test(l.href)
+      );
+
+      if (!statusLink) {
+        throw new Error(
+          `Columbus Data: could not find Terminal Status link on main page. Links found: ${allLinks.map(l => l.text || l.href).join(", ")}`
+        );
+      }
+
+      logger.info({ statusLink }, "Columbus Data: navigating to terminal status page");
+      page.goto(statusLink.href).catch(() => {}); // fire-and-forget
     }
 
     // -----------------------------------------------------------------------
