@@ -195,47 +195,49 @@ export async function scrapeColumbusData(
     // -----------------------------------------------------------------------
     if (!currentUrl.includes("CurrentTerminalStatus")) {
       logger.info("Columbus Data: navigating to terminal status page");
-      // Use "domcontentloaded" — Telerik RadAjaxManager keeps persistent
-      // background connections open so "networkidle2" never fires.
-      await page.goto(STATUS_URL, { waitUntil: "domcontentloaded" });
-      // Give JS a moment to render the Telerik controls
-      await page.waitForTimeout(3_000);
+      // Fire-and-forget navigation — don't await the goto itself because the
+      // page never reaches networkidle2 or even domcontentloaded reliably due
+      // to Telerik's persistent XHR connections and slow server redirects.
+      // Instead we wait for the specific element we need.
+      page.goto(STATUS_URL).catch(() => {}); // intentional fire-and-forget
     }
+
+    // -----------------------------------------------------------------------
+    // Step 3: Wait for terminal selector and log page elements
+    // -----------------------------------------------------------------------
+    // Wait up to 45s for any element whose ID contains "radTerminalSelector"
+    logger.info("Columbus Data: waiting for terminal selector...");
+    const terminalSelectorFound = await page
+      .waitForSelector("[id*='radTerminalSelector']", { timeout: 45_000 })
+      .then(() => true)
+      .catch(() => false);
 
     const statusUrl = page.url();
     const statusTitle = await page.title();
-    logger.info({ statusUrl, statusTitle }, "Columbus Data: terminal status page loaded");
 
-    // Log all inputs + selects visible on the page so we know the exact IDs
+    // Log what's on the page regardless of whether selector was found
     const pageElements = await page.evaluate(() => ({
+      url: window.location.href,
       inputs: Array.from(document.querySelectorAll("input")).map((el) => ({
-        id: el.id, name: el.name, type: el.type,
+        id: (el as HTMLInputElement).id,
+        name: (el as HTMLInputElement).name,
+        type: (el as HTMLInputElement).type,
       })),
       selects: Array.from(document.querySelectorAll("select")).map((el) => ({
-        id: el.id, name: el.name, optionCount: el.options.length,
+        id: (el as HTMLSelectElement).id,
+        name: (el as HTMLSelectElement).name,
+        optionCount: (el as HTMLSelectElement).options.length,
       })),
-      // Grab all element IDs that contain "terminal" (case-insensitive)
       terminalEls: Array.from(document.querySelectorAll("[id]"))
-        .filter((el) => /terminal/i.test(el.id))
-        .map((el) => ({ id: el.id, tag: el.tagName })),
+        .filter((el) => /terminal/i.test((el as HTMLElement).id))
+        .map((el) => ({ id: (el as HTMLElement).id, tag: el.tagName })),
     }));
-    logger.info(pageElements, "Columbus Data: status page elements");
-
-    // -----------------------------------------------------------------------
-    // Step 3: Get all terminal IDs from the dropdown
-    // -----------------------------------------------------------------------
-    // Wait for ANY of: the Telerik dropdown wrapper, the hidden ClientState input,
-    // or a plain <select> — whichever appears first. Timeout 30s.
-    const terminalSelectorFound = await Promise.race([
-      page.waitForSelector("[id*='radTerminalSelector']", { timeout: 30_000 }).then(() => true),
-      page.waitForSelector("select[id*='erminal'], select[name*='erminal']", { timeout: 30_000 }).then(() => true),
-    ]).catch(() => false);
+    logger.info({ statusUrl, statusTitle, terminalSelectorFound, ...pageElements }, "Columbus Data: status page state");
 
     if (!terminalSelectorFound) {
-      // Dump partial page HTML to help debug
-      const bodySnippet = await page.evaluate(() => document.body?.innerHTML?.slice(0, 2000) ?? "");
-      logger.warn({ bodySnippet }, "Columbus Data: terminal selector not found — page snippet");
-      throw new Error("Columbus Data: terminal selector not found on status page after 30s");
+      const bodySnippet = await page.evaluate(() => document.body?.innerHTML?.slice(0, 3000) ?? "");
+      logger.warn({ bodySnippet }, "Columbus Data: terminal selector not found — body snippet");
+      throw new Error("Columbus Data: terminal selector not found on status page after 45s");
     }
 
     const terminals = await extractTerminalList(page);
