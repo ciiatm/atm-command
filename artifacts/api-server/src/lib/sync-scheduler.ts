@@ -23,6 +23,7 @@ async function syncPortal(portal: {
   username: string;
   passwordEncrypted: string;
 }) {
+  const startedAt = Date.now();
   logger.info({ portalId: portal.id, portalName: portal.name }, "Auto-sync: starting");
 
   let success = false;
@@ -178,6 +179,8 @@ async function syncPortal(portal: {
     logger.error({ portalId: portal.id, err }, "Auto-sync error");
   }
 
+  const durationSeconds = Math.round((Date.now() - startedAt) / 1000);
+
   await db
     .update(portalsTable)
     .set({ lastSynced: new Date(), lastSyncStatus: success ? "success" : "failed" })
@@ -188,9 +191,10 @@ async function syncPortal(portal: {
     success,
     message,
     atmsUpdated,
+    durationSeconds,
   });
 
-  logger.info({ portalId: portal.id, success, atmsUpdated, alertsCreated }, "Auto-sync: complete");
+  logger.info({ portalId: portal.id, success, atmsUpdated, alertsCreated, durationSeconds }, "Auto-sync: complete");
 }
 
 // ---------------------------------------------------------------------------

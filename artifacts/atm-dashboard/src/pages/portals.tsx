@@ -9,6 +9,13 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { useToast } from "@/hooks/use-toast";
 import { RefreshCw, Plus, CheckCircle, XCircle, Clock, Server, Zap } from "lucide-react";
 
+function formatDuration(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return s > 0 ? `${m}m ${s}s` : `${m}m`;
+}
+
 function syncStatusBadge(success: boolean | string | null | undefined) {
   if (success === true || success === "success") return <Badge className="bg-emerald-500/15 text-emerald-600 border-emerald-500/30 hover:bg-emerald-500/15"><CheckCircle className="w-3 h-3 mr-1" />Success</Badge>;
   if (success === false || success === "failed") return <Badge className="bg-red-500/15 text-red-600 border-red-500/30 hover:bg-red-500/15"><XCircle className="w-3 h-3 mr-1" />Failed</Badge>;
@@ -169,6 +176,11 @@ export default function PortalsPage() {
                   <span className="text-muted-foreground ml-2">{h.syncedAt ? new Date(h.syncedAt).toLocaleString() : ""}</span>
                 </div>
                 <span className="text-muted-foreground">{h.atmsUpdated ?? 0} ATMs updated</span>
+                {(h as any).durationSeconds != null && (
+                  <span className="text-xs text-muted-foreground tabular-nums">
+                    {formatDuration((h as any).durationSeconds)}
+                  </span>
+                )}
                 {syncStatusBadge(h.success)}
                 {h.message && !h.success && <span className="text-xs text-red-500 truncate max-w-xs" title={h.message}>{h.message}</span>}
               </div>

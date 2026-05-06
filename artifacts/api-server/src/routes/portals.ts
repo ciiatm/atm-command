@@ -188,6 +188,7 @@ router.post("/portals/:id/sync", async (req, res) => {
 async function runSyncInBackground(portal: {
   id: number; name: string; username: string; passwordEncrypted: string; syncIntervalHours: number;
 }) {
+  const startedAt = Date.now();
   let result: { success: boolean; message: string; atmsUpdated: number; alertsCreated: number };
   try {
     result = await performPortalSync(portal);
@@ -195,6 +196,7 @@ async function runSyncInBackground(portal: {
     const message = err instanceof Error ? err.message : String(err);
     result = { success: false, message, atmsUpdated: 0, alertsCreated: 0 };
   }
+  const durationSeconds = Math.round((Date.now() - startedAt) / 1000);
 
   await db
     .update(portalsTable)
@@ -206,6 +208,7 @@ async function runSyncInBackground(portal: {
     success: result.success,
     message: result.message,
     atmsUpdated: result.atmsUpdated,
+    durationSeconds,
   });
 }
 

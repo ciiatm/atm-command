@@ -43,6 +43,7 @@ export const portalSyncHistoryTable = pgTable("portal_sync_history", {
   success: boolean("success").notNull(),
   message: text("message").notNull(),
   atmsUpdated: integer("atms_updated").notNull().default(0),
+  durationSeconds: integer("duration_seconds"),
   syncedAt: timestamp("synced_at").notNull().defaultNow(),
 });
 

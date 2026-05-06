@@ -211,23 +211,27 @@ export async function scrapeColumbusData(
 async function scrapeActiveTerminalsReport(page: Page): Promise<Map<string, ActiveTerminalInfo>> {
   logger.info({ url: ACTIVE_TERMINALS_URL }, "Columbus Data: navigating to active terminals report");
 
-  // Fire-and-forget navigate; the page may keep loading indefinitely
   page.goto(ACTIVE_TERMINALS_URL).catch(() => {});
 
-  // Give the page up to 30 s to render some kind of table
-  await new Promise(r => setTimeout(r, 5_000));
+  // Wait up to 20s for any table to appear
+  const tableAppeared = await page.waitForSelector("table", { timeout: 20_000 })
+    .then(() => true).catch(() => false);
 
-  // If there's a "View Report" / "Submit" button (common in SSRS wrappers) click it
-  await page.evaluate(() => {
-    const btn = Array.from(document.querySelectorAll("input[type=submit], button"))
-      .find(el => /view|submit|run|generate/i.test((el as HTMLElement).innerText ?? "")) as HTMLElement | null;
-    if (btn) btn.click();
-  }).catch(() => {});
+  // If no table yet, check for a "View Report" / "Submit" button and click it
+  if (!tableAppeared) {
+    const clicked = await page.evaluate(() => {
+      const btn = Array.from(document.querySelectorAll<HTMLElement>("input[type=submit], button, input[type=button]"))
+        .find(el => /view|submit|run|generate/i.test(el.value ?? el.innerText ?? ""));
+      if (btn) { btn.click(); return true; }
+      return false;
+    }).catch(() => false);
 
-  await new Promise(r => setTimeout(r, 5_000));
+    if (clicked) {
+      await page.waitForSelector("table", { timeout: 20_000 }).catch(() => {});
+    }
+  }
 
-  // The content might be rendered directly in the page or inside an iframe.
-  // Try the main page first, then each iframe.
+  // Helper that parses the terminal table from a page or frame context
   const scrapeTable = async (ctx: Page | import("puppeteer").Frame) => {
     return ctx.evaluate(() => {
       function cellText(el: Element): string {
@@ -238,36 +242,40 @@ async function scrapeActiveTerminalsReport(page: Page): Promise<Map<string, Acti
         return isNaN(n) ? null : n;
       }
 
-      // Find all tables; pick the one that looks like a terminal list
+      // Find the most data-rich table that looks like a terminal list
       const tables = Array.from(document.querySelectorAll("table"));
       let best: HTMLTableElement | null = null;
       for (const t of tables) {
-        const text = t.textContent?.toLowerCase() ?? "";
+        const text = (t.textContent ?? "").toLowerCase();
         if ((text.includes("terminal") || text.includes("location")) && t.rows.length > 3) {
-          best = t;
-          break;
+          if (!best || t.rows.length > best.rows.length) best = t;
         }
       }
       if (!best) return null;
 
-      // Detect header row
       const allRows = Array.from(best.querySelectorAll("tr"));
+
+      // Find header row (contains "terminal" and at least one of address/location/surcharge)
       const headerRow = allRows.find(r => {
-        const t = (r.textContent ?? "").toLowerCase();
-        return t.includes("terminal") && (t.includes("address") || t.includes("location") || t.includes("surcharge"));
+        const t = (r.textContent ?? "").toLowerCase().replace(/\s+/g, "");
+        return t.includes("terminal") && (t.includes("address") || t.includes("location") || t.includes("surcharge") || t.includes("city"));
       });
       if (!headerRow) return null;
 
-      const headers = Array.from(headerRow.querySelectorAll("th, td")).map(h => cellText(h).toLowerCase());
-      const idx = (kw: string) => headers.findIndex(h => h.includes(kw));
+      // Space-stripped comparison so "Terminal ID" matches keyword "terminalid"
+      const headers = Array.from(headerRow.querySelectorAll("th, td"))
+        .map(h => cellText(h).toLowerCase());
+      const idx = (kw: string) => {
+        const kwNorm = kw.replace(/\s+/g, "");
+        return headers.findIndex(h => h.replace(/\s+/g, "").includes(kwNorm));
+      };
 
-      // Column indices — use Excel export column order as fallback positions
-      const termIdIdx   = idx("terminal id") !== -1 ? idx("terminal id") : idx("term id") !== -1 ? idx("term id") : 0;
-      const nameIdx     = idx("location name") !== -1 ? idx("location name") : idx("location") !== -1 ? idx("location") : 2;
-      const addressIdx  = idx("address") !== -1 ? idx("address") : 3;
-      const cityIdx     = idx("city") !== -1 ? idx("city") : 5;
-      const stateIdx    = idx("state") !== -1 ? idx("state") : 6;
-      const modelIdx    = idx("machine type") !== -1 ? idx("machine type") : idx("model") !== -1 ? idx("model") : 12;
+      const termIdIdx    = idx("terminalid") !== -1 ? idx("terminalid") : idx("termid") !== -1 ? idx("termid") : 0;
+      const nameIdx      = idx("locationname") !== -1 ? idx("locationname") : idx("location") !== -1 ? idx("location") : 2;
+      const addressIdx   = idx("address") !== -1 ? idx("address") : 3;
+      const cityIdx      = idx("city") !== -1 ? idx("city") : 5;
+      const stateIdx     = idx("state") !== -1 ? idx("state") : 6;
+      const modelIdx     = idx("machinetype") !== -1 ? idx("machinetype") : idx("model") !== -1 ? idx("model") : -1;
       const surchargeIdx = idx("surcharge") !== -1 ? idx("surcharge") : -1;
 
       const result: {
@@ -285,34 +293,34 @@ async function scrapeActiveTerminalsReport(page: Page): Promise<Map<string, Acti
         const cells = Array.from(allRows[i].querySelectorAll("td"));
         if (cells.length < 3) continue;
         const terminalId = cellText(cells[termIdIdx] ?? cells[0]);
-        if (!terminalId || /active terminal|terminal id/i.test(terminalId)) continue;
+        if (!terminalId || /active terminal|terminal id|^total/i.test(terminalId)) continue;
 
         const surchargeRaw = surchargeIdx >= 0 && cells[surchargeIdx] ? cellText(cells[surchargeIdx]) : "";
         result.push({
           terminalId,
           locationName: nameIdx < cells.length ? cellText(cells[nameIdx]) || null : null,
-          address: addressIdx < cells.length ? cellText(cells[addressIdx]) || null : null,
-          city: cityIdx < cells.length ? cellText(cells[cityIdx]) || null : null,
-          state: stateIdx < cells.length ? cellText(cells[stateIdx]) || null : null,
-          makeModel: modelIdx < cells.length ? cellText(cells[modelIdx]) || null : null,
-          surcharge: surchargeRaw ? parseDollar(surchargeRaw) : null,
+          address:      addressIdx < cells.length ? cellText(cells[addressIdx]) || null : null,
+          city:         cityIdx < cells.length ? cellText(cells[cityIdx]) || null : null,
+          state:        stateIdx < cells.length ? cellText(cells[stateIdx]) || null : null,
+          makeModel:    modelIdx >= 0 && modelIdx < cells.length ? cellText(cells[modelIdx]) || null : null,
+          surcharge:    surchargeRaw ? parseDollar(surchargeRaw) : null,
         });
       }
-      return result;
+      return result.length > 0 ? result : null;
     });
   };
 
-  // Try main page
+  // Try the main frame first, then any child iframes
   let rows = await scrapeTable(page).catch(() => null);
-
-  // If nothing found, try each iframe
-  if (!rows || rows.length === 0) {
+  if (!rows) {
     for (const frame of page.frames()) {
       if (frame === page.mainFrame()) continue;
       rows = await scrapeTable(frame as any).catch(() => null);
-      if (rows && rows.length > 0) break;
+      if (rows) break;
     }
   }
+
+  logger.info({ count: rows?.length ?? 0, sample: rows?.[0] ?? null }, "Columbus Data: active terminals report scraped");
 
   const infoMap = new Map<string, ActiveTerminalInfo>();
   for (const row of rows ?? []) {
@@ -327,8 +335,6 @@ async function scrapeActiveTerminalsReport(page: Page): Promise<Map<string, Acti
       });
     }
   }
-
-  logger.info({ count: infoMap.size }, "Columbus Data: active terminals report scraped");
   return infoMap;
 }
 
@@ -408,13 +414,15 @@ async function scrapeStatusReportGrid(page: Page): Promise<GridRow[]> {
         if (cells.length < 2) return;
 
         // Try to find columns by header name first, otherwise use position
-        const idxOf = (keyword: string) => headers.findIndex((h) => h.includes(keyword));
+        // Strip whitespace before matching so "Cash Balance" matches "cashbalance"
+        const idxOf = (keyword: string) =>
+          headers.findIndex((h) => h.replace(/\s+/g, "").includes(keyword.replace(/\s+/g, "")));
 
         const termIdIdx = idxOf("terminalid") !== -1 ? idxOf("terminalid") : 0;
         const nameIdx = idxOf("name") !== -1 ? idxOf("name") : 1;
-        const balanceIdx = idxOf("cashbalance") !== -1 ? idxOf("cashbalance") : 3;
-        const lastContactIdx = idxOf("lastcommunication") !== -1 ? idxOf("lastcommunication") : -1;
-        const lastErrorIdx = idxOf("lasterror") !== -1 ? idxOf("lasterror") : -1;
+        const balanceIdx = idxOf("cashbalance") !== -1 ? idxOf("cashbalance") : idxOf("balance") !== -1 ? idxOf("balance") : 3;
+        const lastContactIdx = idxOf("lastcommunication") !== -1 ? idxOf("lastcommunication") : idxOf("communication") !== -1 ? idxOf("communication") : idxOf("lastcontact") !== -1 ? idxOf("lastcontact") : -1;
+        const lastErrorIdx = idxOf("lasterror") !== -1 ? idxOf("lasterror") : idxOf("error") !== -1 ? idxOf("error") : -1;
 
         const terminalId = cellText(cells[termIdIdx] ?? cells[0]);
         if (!terminalId || terminalId === "Terminal ID") return; // skip header rows
