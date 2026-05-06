@@ -44,6 +44,8 @@ export const atmsTable = pgTable("atms", {
   lastSynced: timestamp("last_synced"),
   avgDailyTransactions: real("avg_daily_transactions"),
   avgDailyDispensed: real("avg_daily_dispensed"),
+  surcharge: real("surcharge"),
+  makeModel: text("make_model"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 

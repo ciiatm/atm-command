@@ -19,6 +19,7 @@ import { logger } from "../logger.js";
 const LOGIN_URL = "https://www.columbusdata.net/cdswebtool/login/login.aspx";
 const REPORT_URL = "https://www.columbusdata.net/cdswebtool/QuickView/TerminalStatusReport.aspx";
 const MONITOR_URL = "https://www.columbusdata.net/cdswebtool/TerminalMonitoring/TermIDStatus.aspx";
+const ACTIVE_TERMINALS_URL = "https://www.columbusdata.net/cdswebtool/includes/ReportViewer.aspx?reportname=rptActiveTerminals";
 
 export interface ColumbusTransaction {
   transactedAt: string;
@@ -32,14 +33,30 @@ export interface ColumbusTransaction {
 export interface ColumbusTerminalStatus {
   terminalId: string;
   terminalLabel: string;
-  currentBalance: number | null;
-  surcharge: number | null;
-  lastContact: string | null;
+  // From the Active Terminals report
+  locationName: string | null;
+  address: string | null;
+  city: string | null;
+  state: string | null;
   makeModel: string | null;
+  surcharge: number | null;
+  // From the Status Report grid
+  currentBalance: number | null;
+  lastContact: string | null;
   dailyCashDispensed: number | null;
   dailyTransactionCount: number | null;
   isOnline: boolean;
   transactions: ColumbusTransaction[];
+}
+
+// Info pulled from the Active Terminals report
+interface ActiveTerminalInfo {
+  locationName: string | null;
+  address: string | null;
+  city: string | null;
+  state: string | null;
+  makeModel: string | null;
+  surcharge: number | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -105,7 +122,13 @@ export async function scrapeColumbusData(
     }
 
     // ------------------------------------------------------------------
-    // Step 2: Scrape the Terminal Status Report grid (all terminals at once)
+    // Step 2: Scrape the Active Terminals report for location/address info
+    // ------------------------------------------------------------------
+    const activeTerminalsMap = await scrapeActiveTerminalsReport(page);
+    logger.info({ count: activeTerminalsMap.size }, "Columbus Data: active terminals report done");
+
+    // ------------------------------------------------------------------
+    // Step 3: Scrape the Terminal Status Report grid (balance / online status)
     // ------------------------------------------------------------------
     logger.info({ url: REPORT_URL }, "Columbus Data: navigating to status report grid");
     page.goto(REPORT_URL).catch(() => {});
@@ -134,9 +157,8 @@ export async function scrapeColumbusData(
     }
 
     // ------------------------------------------------------------------
-    // Step 3: For each terminal, get today's transactions from the monitor
+    // Step 4: For each terminal, get today's transactions from the monitor
     // ------------------------------------------------------------------
-    // Navigate to the terminal monitor page for transaction detail
     logger.info({ url: MONITOR_URL }, "Columbus Data: navigating to terminal monitor for transactions");
     page.goto(MONITOR_URL).catch(() => {});
 
@@ -149,6 +171,9 @@ export async function scrapeColumbusData(
     const results: ColumbusTerminalStatus[] = [];
 
     for (const row of gridRows) {
+      // Merge in location/address info from the active terminals report
+      const info = activeTerminalsMap.get(row.terminalId);
+
       // Look up transactions for this terminal if the monitor is available
       let transactions: ColumbusTransaction[] = [];
       if (monitorFound) {
@@ -158,7 +183,17 @@ export async function scrapeColumbusData(
           logger.warn({ termId: row.terminalId, err: (err as Error).message }, "Columbus Data: transaction scrape failed, skipping");
         }
       }
-      results.push({ ...row, transactions });
+
+      results.push({
+        ...row,
+        locationName: info?.locationName ?? null,
+        address: info?.address ?? null,
+        city: info?.city ?? null,
+        state: info?.state ?? null,
+        makeModel: info?.makeModel ?? row.makeModel,
+        surcharge: info?.surcharge ?? null,
+        transactions,
+      });
     }
 
     logger.info({ count: results.length }, "Columbus Data: sync complete");
@@ -166,6 +201,135 @@ export async function scrapeColumbusData(
   } finally {
     await browser?.close().catch(() => {});
   }
+}
+
+// ---------------------------------------------------------------------------
+// Active Terminals report scraping (ReportViewer.aspx?reportname=rptActiveTerminals)
+// Gives us: location name, address, city, state, machine type, surcharge
+// ---------------------------------------------------------------------------
+
+async function scrapeActiveTerminalsReport(page: Page): Promise<Map<string, ActiveTerminalInfo>> {
+  logger.info({ url: ACTIVE_TERMINALS_URL }, "Columbus Data: navigating to active terminals report");
+
+  // Fire-and-forget navigate; the page may keep loading indefinitely
+  page.goto(ACTIVE_TERMINALS_URL).catch(() => {});
+
+  // Give the page up to 30 s to render some kind of table
+  await new Promise(r => setTimeout(r, 5_000));
+
+  // If there's a "View Report" / "Submit" button (common in SSRS wrappers) click it
+  await page.evaluate(() => {
+    const btn = Array.from(document.querySelectorAll("input[type=submit], button"))
+      .find(el => /view|submit|run|generate/i.test((el as HTMLElement).innerText ?? "")) as HTMLElement | null;
+    if (btn) btn.click();
+  }).catch(() => {});
+
+  await new Promise(r => setTimeout(r, 5_000));
+
+  // The content might be rendered directly in the page or inside an iframe.
+  // Try the main page first, then each iframe.
+  const scrapeTable = async (ctx: Page | import("puppeteer").Frame) => {
+    return ctx.evaluate(() => {
+      function cellText(el: Element): string {
+        return (el.textContent ?? "").replace(/\s+/g, " ").trim();
+      }
+      function parseDollar(raw: string): number | null {
+        const n = parseFloat(raw.replace(/[$,\s]/g, ""));
+        return isNaN(n) ? null : n;
+      }
+
+      // Find all tables; pick the one that looks like a terminal list
+      const tables = Array.from(document.querySelectorAll("table"));
+      let best: HTMLTableElement | null = null;
+      for (const t of tables) {
+        const text = t.textContent?.toLowerCase() ?? "";
+        if ((text.includes("terminal") || text.includes("location")) && t.rows.length > 3) {
+          best = t;
+          break;
+        }
+      }
+      if (!best) return null;
+
+      // Detect header row
+      const allRows = Array.from(best.querySelectorAll("tr"));
+      const headerRow = allRows.find(r => {
+        const t = (r.textContent ?? "").toLowerCase();
+        return t.includes("terminal") && (t.includes("address") || t.includes("location") || t.includes("surcharge"));
+      });
+      if (!headerRow) return null;
+
+      const headers = Array.from(headerRow.querySelectorAll("th, td")).map(h => cellText(h).toLowerCase());
+      const idx = (kw: string) => headers.findIndex(h => h.includes(kw));
+
+      // Column indices — use Excel export column order as fallback positions
+      const termIdIdx   = idx("terminal id") !== -1 ? idx("terminal id") : idx("term id") !== -1 ? idx("term id") : 0;
+      const nameIdx     = idx("location name") !== -1 ? idx("location name") : idx("location") !== -1 ? idx("location") : 2;
+      const addressIdx  = idx("address") !== -1 ? idx("address") : 3;
+      const cityIdx     = idx("city") !== -1 ? idx("city") : 5;
+      const stateIdx    = idx("state") !== -1 ? idx("state") : 6;
+      const modelIdx    = idx("machine type") !== -1 ? idx("machine type") : idx("model") !== -1 ? idx("model") : 12;
+      const surchargeIdx = idx("surcharge") !== -1 ? idx("surcharge") : -1;
+
+      const result: {
+        terminalId: string;
+        locationName: string | null;
+        address: string | null;
+        city: string | null;
+        state: string | null;
+        makeModel: string | null;
+        surcharge: number | null;
+      }[] = [];
+
+      const headerIdx = allRows.indexOf(headerRow);
+      for (let i = headerIdx + 1; i < allRows.length; i++) {
+        const cells = Array.from(allRows[i].querySelectorAll("td"));
+        if (cells.length < 3) continue;
+        const terminalId = cellText(cells[termIdIdx] ?? cells[0]);
+        if (!terminalId || /active terminal|terminal id/i.test(terminalId)) continue;
+
+        const surchargeRaw = surchargeIdx >= 0 && cells[surchargeIdx] ? cellText(cells[surchargeIdx]) : "";
+        result.push({
+          terminalId,
+          locationName: nameIdx < cells.length ? cellText(cells[nameIdx]) || null : null,
+          address: addressIdx < cells.length ? cellText(cells[addressIdx]) || null : null,
+          city: cityIdx < cells.length ? cellText(cells[cityIdx]) || null : null,
+          state: stateIdx < cells.length ? cellText(cells[stateIdx]) || null : null,
+          makeModel: modelIdx < cells.length ? cellText(cells[modelIdx]) || null : null,
+          surcharge: surchargeRaw ? parseDollar(surchargeRaw) : null,
+        });
+      }
+      return result;
+    });
+  };
+
+  // Try main page
+  let rows = await scrapeTable(page).catch(() => null);
+
+  // If nothing found, try each iframe
+  if (!rows || rows.length === 0) {
+    for (const frame of page.frames()) {
+      if (frame === page.mainFrame()) continue;
+      rows = await scrapeTable(frame as any).catch(() => null);
+      if (rows && rows.length > 0) break;
+    }
+  }
+
+  const infoMap = new Map<string, ActiveTerminalInfo>();
+  for (const row of rows ?? []) {
+    if (row.terminalId) {
+      infoMap.set(row.terminalId, {
+        locationName: row.locationName,
+        address: row.address,
+        city: row.city,
+        state: row.state,
+        makeModel: row.makeModel,
+        surcharge: row.surcharge,
+      });
+    }
+  }
+
+  logger.info({ count: infoMap.size }, "Columbus Data: active terminals report scraped");
+  return infoMap;
 }
 
 // ---------------------------------------------------------------------------

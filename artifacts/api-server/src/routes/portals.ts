@@ -326,17 +326,19 @@ async function performColumbusDataSync(portal: {
         const [newAtm] = await db
           .insert(atmsTable)
           .values({
-            name: ts.terminalLabel || ts.terminalId,
-            locationName: ts.terminalLabel || ts.terminalId,
-            address: "Unknown",
-            city: "Unknown",
-            state: "Unknown",
+            name: ts.locationName || ts.terminalLabel || ts.terminalId,
+            locationName: ts.locationName || ts.terminalLabel || ts.terminalId,
+            address: ts.address || "Unknown",
+            city: ts.city || "Unknown",
+            state: ts.state || "Unknown",
             portalSource: "columbus_data",
             portalAtmId: ts.terminalId,
             currentBalance: balance,
             status: resolveStatus(ts, 2000),
             lastSynced: new Date(),
-          })
+            ...(ts.makeModel ? { makeModel: ts.makeModel } : {}),
+            ...(ts.surcharge != null ? { surcharge: ts.surcharge } : {}),
+          } as any)
           .returning();
 
         if (newAtm && balance < (newAtm.lowCashThreshold ?? 2000)) {
@@ -354,19 +356,26 @@ async function performColumbusDataSync(portal: {
       const newBalance = cappedBalance(ts.currentBalance ?? atm.currentBalance);
       const newStatus = resolveStatus({ ...ts, currentBalance: newBalance }, atm.lowCashThreshold ?? 2000);
 
+      // Build update — always refresh balance/status; patch address/location
+      // only when we now have real data (overwriting placeholder "Unknown")
+      const updateSet: Record<string, any> = {
+        currentBalance: newBalance,
+        status: newStatus,
+        lastSynced: new Date(),
+        ...(ts.dailyCashDispensed != null ? { avgDailyDispensed: ts.dailyCashDispensed } : {}),
+        ...(ts.dailyTransactionCount != null ? { avgDailyTransactions: ts.dailyTransactionCount } : {}),
+        ...(ts.surcharge != null ? { surcharge: ts.surcharge } : {}),
+        ...(ts.makeModel ? { makeModel: ts.makeModel } : {}),
+        // Patch address/name only if the report gave us real data
+        ...(ts.locationName ? { locationName: ts.locationName } : {}),
+        ...(ts.address ? { address: ts.address } : {}),
+        ...(ts.city ? { city: ts.city } : {}),
+        ...(ts.state ? { state: ts.state } : {}),
+      };
+
       await db
         .update(atmsTable)
-        .set({
-          currentBalance: newBalance,
-          status: newStatus,
-          lastSynced: new Date(),
-          ...(ts.dailyCashDispensed != null
-            ? { avgDailyDispensed: ts.dailyCashDispensed }
-            : {}),
-          ...(ts.dailyTransactionCount != null
-            ? { avgDailyTransactions: ts.dailyTransactionCount }
-            : {}),
-        })
+        .set(updateSet)
         .where(eq(atmsTable.id, atm.id));
 
       if (newStatus === "low_cash" || newStatus === "error") {

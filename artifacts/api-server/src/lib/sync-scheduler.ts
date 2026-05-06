@@ -63,22 +63,30 @@ async function syncPortal(portal: {
               lastSynced: new Date(),
               ...(ts.dailyCashDispensed != null ? { avgDailyDispensed: ts.dailyCashDispensed } : {}),
               ...(ts.dailyTransactionCount != null ? { avgDailyTransactions: ts.dailyTransactionCount } : {}),
-            })
+              ...(ts.surcharge != null ? { surcharge: ts.surcharge } : {}),
+              ...(ts.makeModel ? { makeModel: ts.makeModel } : {}),
+              ...(ts.locationName ? { locationName: ts.locationName } : {}),
+              ...(ts.address ? { address: ts.address } : {}),
+              ...(ts.city ? { city: ts.city } : {}),
+              ...(ts.state ? { state: ts.state } : {}),
+            } as any)
             .where(eq(atmsTable.id, atm.id));
         } else {
           // Auto-create
           const [created] = await db.insert(atmsTable).values({
-            name: ts.terminalLabel || ts.terminalId,
-            locationName: ts.terminalLabel || ts.terminalId,
-            address: "Unknown",
-            city: "Unknown",
-            state: "Unknown",
+            name: ts.locationName || ts.terminalLabel || ts.terminalId,
+            locationName: ts.locationName || ts.terminalLabel || ts.terminalId,
+            address: ts.address || "Unknown",
+            city: ts.city || "Unknown",
+            state: ts.state || "Unknown",
             portalSource: "columbus_data",
             portalAtmId: ts.terminalId,
             currentBalance: newBalance,
             status: newStatus,
             lastSynced: new Date(),
-          }).returning();
+            ...(ts.makeModel ? { makeModel: ts.makeModel } : {}),
+            ...(ts.surcharge != null ? { surcharge: ts.surcharge } : {}),
+          } as any).returning();
           atmId = created?.id ?? null;
         }
 

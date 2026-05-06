@@ -120,8 +120,10 @@ function ATMDetailSheet({ atm, open, onClose }: { atm: Atm | null; open: boolean
               <div><span className="text-muted-foreground">Status</span><div className="mt-1">{statusBadge(atm.status)}</div></div>
               <div><span className="text-muted-foreground">Portal</span><div className="mt-1 font-medium capitalize">{atm.portalSource?.replace(/_/g, " ")}</div></div>
               <div><span className="text-muted-foreground">Terminal ID</span><div className="mt-1 font-mono text-xs font-medium">{atm.portalAtmId ?? "—"}</div></div>
+              <div><span className="text-muted-foreground">Surcharge</span><div className="mt-1 font-medium">{(atm as any).surcharge != null ? `$${Number((atm as any).surcharge).toFixed(2)}` : "—"}</div></div>
               <div><span className="text-muted-foreground">Low Cash Threshold</span><div className="mt-1 font-medium">${atm.lowCashThreshold.toLocaleString()}</div></div>
               <div><span className="text-muted-foreground">Cash Capacity</span><div className="mt-1 font-medium">${atm.cashCapacity.toLocaleString()}</div></div>
+              {(atm as any).makeModel && <div><span className="text-muted-foreground">Machine Type</span><div className="mt-1 font-medium">{(atm as any).makeModel}</div></div>}
               <div><span className="text-muted-foreground">Last Synced</span><div className="mt-1 font-medium">{atm.lastSynced ? new Date(atm.lastSynced).toLocaleString() : "Never"}</div></div>
               {addressLine(atm) && (
                 <div className="col-span-2"><span className="text-muted-foreground">Address</span><div className="mt-1 font-medium">{addressLine(atm)}</div></div>
