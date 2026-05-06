@@ -3,14 +3,13 @@
  *
  * Strategy:
  * 1. Login
- * 2. Navigate to TermIDStatus.aspx (Real Time Terminal Status page)
- * 3. Scrape Table2 (Merchant Info: Terminal ID, Location Name, Address, City,
- *    State, Postal Code, Property Type) and Table3 (Terminal Status: Make/Model,
- *    Balance, Last Contact) for the current terminal
- * 4. Click "Next Terminal" (#btnNext) to advance and repeat
- * 5. Stop when a terminal ID is seen a second time (loop detection)
- * 6. If TermIDStatus approach returns 0 results, fall back to the proven
- *    grid + Active Terminals report approach
+ * 2. Scrape TerminalStatusReport.aspx grid — terminal IDs, balance, last contact (FAST)
+ * 3. Scrape rptTerminalListType report — postal code, property type, and any extra fields
+ * 4. Scrape rptActiveTerminals report — location name, address, city, state, make/model, surcharge
+ * 5. Merge all three sources by terminal ID and return
+ *
+ * Steps 3 and 4 both run against ReportViewer.aspx pages (bulk tables, fast).
+ * No per-terminal navigation required.
  */
 
 import puppeteer, { type Browser, type Page } from "puppeteer";
@@ -18,36 +17,27 @@ import { execSync } from "node:child_process";
 import { logger } from "../logger.js";
 
 const LOGIN_URL        = "https://www.columbusdata.net/cdswebtool/login/login.aspx";
-const TERM_STATUS_URL  = "https://www.columbusdata.net/cdswebtool/QuickView/TermIDStatus.aspx";
 const REPORT_URL       = "https://www.columbusdata.net/cdswebtool/QuickView/TerminalStatusReport.aspx";
 const ACTIVE_TERMS_URL = "https://www.columbusdata.net/cdswebtool/includes/ReportViewer.aspx?reportname=rptActiveTerminals";
+const TERM_LIST_URL    = "https://www.columbusdata.net/cdswebtool/includes/ReportViewer.aspx?reportname=rptTerminalListType";
 
 export interface ColumbusTerminalStatus {
   terminalId: string;
   terminalLabel: string;
-  // From Table2 (Merchant Info)
+  // From rptActiveTerminals
   locationName: string | null;
   address: string | null;
   city: string | null;
   state: string | null;
-  postalCode: string | null;
-  propertyType: string | null;
-  // From Table3 (Terminal Status) / Active Terminals report
   makeModel: string | null;
   surcharge: number | null;
-  // From Table3 (Terminal Status) / Status Report grid
+  // From rptTerminalListType
+  postalCode: string | null;
+  propertyType: string | null;
+  // From TerminalStatusReport grid
   currentBalance: number | null;
   lastContact: string | null;
   isOnline: boolean;
-}
-
-interface ActiveTerminalInfo {
-  locationName: string | null;
-  address: string | null;
-  city: string | null;
-  state: string | null;
-  makeModel: string | null;
-  surcharge: number | null;
 }
 
 function findChromiumExecutable(): string | undefined {
@@ -99,19 +89,90 @@ export async function scrapeColumbusData(
     logger.info("Columbus Data: login successful");
 
     // ------------------------------------------------------------------
-    // Step 2: Try TermIDStatus.aspx approach (primary)
+    // Step 2: TerminalStatusReport grid — balance, last contact, IDs (FAST)
     // ------------------------------------------------------------------
-    const termIdResults = await scrapeViaTermIDStatus(page);
-    if (termIdResults.length > 0) {
-      logger.info({ count: termIdResults.length }, "Columbus Data: TermIDStatus scrape complete");
-      return termIdResults;
+    logger.info("Columbus Data: navigating to terminal status grid");
+    page.goto(REPORT_URL).catch(() => {});
+
+    const gridFound = await page
+      .waitForSelector("table[id*='rgTermStatusReport']", { timeout: 45_000 })
+      .then(() => true).catch(() => false);
+
+    if (!gridFound) {
+      const html = await page.evaluate(() => document.body?.innerHTML?.slice(0, 2000) ?? "");
+      logger.warn({ html }, "Columbus Data: grid not found");
+      throw new Error("Columbus Data: status report grid not found after 45s");
+    }
+
+    // Try to expand page size to get all terminals on one page
+    try {
+      const sizeInput = await page.$("#rgTermStatusReport_ctl00_ctl03_ctl01_PageSizeComboBox_Input");
+      if (sizeInput) {
+        await sizeInput.click({ clickCount: 3 });
+        await sizeInput.type("500");
+        await sizeInput.press("Enter");
+        await new Promise(r => setTimeout(r, 3_000));
+      }
+    } catch { /* ignore */ }
+
+    const gridRows = await scrapeStatusGrid(page);
+    logger.info({ count: gridRows.length }, "Columbus Data: grid scraped");
+
+    if (gridRows.length === 0) {
+      throw new Error("Columbus Data: no terminal rows found in status report grid");
     }
 
     // ------------------------------------------------------------------
-    // Fallback: Grid + Active Terminals report (proven, 76 ATMs)
+    // Step 3: rptTerminalListType — postal code, property type, extra info
     // ------------------------------------------------------------------
-    logger.warn("Columbus Data: TermIDStatus returned 0 results — falling back to grid approach");
-    return await scrapeViaGridAndReport(page);
+    const terminalListMap = await scrapeReportTable(page, TERM_LIST_URL, "rptTerminalListType");
+    logger.info({ count: terminalListMap.size }, "Columbus Data: rptTerminalListType scraped");
+
+    // ------------------------------------------------------------------
+    // Step 4: rptActiveTerminals — location name, address, city, state, make/model, surcharge
+    // ------------------------------------------------------------------
+    const activeTerminalsMap = await scrapeReportTable(page, ACTIVE_TERMS_URL, "rptActiveTerminals");
+    logger.info({ count: activeTerminalsMap.size }, "Columbus Data: rptActiveTerminals scraped");
+
+    // ------------------------------------------------------------------
+    // Step 5: Merge and return
+    // ------------------------------------------------------------------
+    const results: ColumbusTerminalStatus[] = gridRows.map(row => {
+      const active = activeTerminalsMap.get(row.terminalId);
+      const listType = terminalListMap.get(row.terminalId);
+
+      // Prefer terminalListType for postal code / property type;
+      // fall back to activeTerminals if terminalListType didn't have them
+      const postalCode   = listType?.postalCode   ?? active?.postalCode   ?? null;
+      const propertyType = listType?.propertyType ?? active?.propertyType ?? null;
+
+      return {
+        terminalId: row.terminalId,
+        terminalLabel: row.terminalLabel,
+        locationName: active?.locationName ?? listType?.locationName ?? null,
+        address:      active?.address      ?? listType?.address      ?? null,
+        city:         active?.city         ?? listType?.city         ?? null,
+        state:        active?.state        ?? listType?.state        ?? null,
+        makeModel:    active?.makeModel    ?? listType?.makeModel    ?? null,
+        surcharge:    active?.surcharge    ?? listType?.surcharge    ?? null,
+        postalCode,
+        propertyType,
+        currentBalance: row.currentBalance,
+        lastContact:    row.lastContact,
+        isOnline:       row.isOnline,
+      };
+    });
+
+    // Deduplicate by terminal ID
+    const seen = new Set<string>();
+    const deduped = results.filter(r => {
+      if (seen.has(r.terminalId)) return false;
+      seen.add(r.terminalId);
+      return true;
+    });
+
+    logger.info({ scraped: results.length, deduped: deduped.length }, "Columbus Data: sync complete");
+    return deduped;
 
   } finally {
     await browser?.close().catch(() => {});
@@ -119,340 +180,55 @@ export async function scrapeColumbusData(
 }
 
 // ---------------------------------------------------------------------------
-// PRIMARY: TermIDStatus.aspx — cycles through all terminals using Next button
+// Generic ReportViewer.aspx table scraper
+// Handles both rptActiveTerminals and rptTerminalListType (same page structure)
+// Returns a Map<terminalId, record> with all columns keyed by lowercase header
 // ---------------------------------------------------------------------------
 
-async function scrapeViaTermIDStatus(page: Page): Promise<ColumbusTerminalStatus[]> {
-  logger.info({ url: TERM_STATUS_URL }, "Columbus Data: navigating to TermIDStatus.aspx");
-  await page.goto(TERM_STATUS_URL, { waitUntil: "domcontentloaded" });
-
-  // Wait up to 10s for Table2 to show data (session may pre-load a terminal)
-  let table2Loaded = await page.waitForSelector("#Table2 td.tmdata", { timeout: 10_000 })
-    .then(() => true).catch(() => false);
-
-  if (!table2Loaded) {
-    // No terminal pre-loaded — click Get Status to load the first/default terminal
-    logger.info("Columbus Data: Table2 empty on load — clicking Get Status");
-    await page.evaluate(() => {
-      const btn = document.querySelector<HTMLElement>("#btnGetStatus");
-      if (btn) btn.click();
-    });
-    table2Loaded = await page.waitForSelector("#Table2 td.tmdata", { timeout: 20_000 })
-      .then(() => true).catch(() => false);
-  }
-
-  if (!table2Loaded) {
-    logger.warn("Columbus Data: TermIDStatus Table2 not found — page may require terminal selection");
-    return [];
-  }
-
-  // Give UpdatePanel a moment to settle
-  await new Promise(r => setTimeout(r, 1_000));
-
-  const results: ColumbusTerminalStatus[] = [];
-  const seenIds = new Set<string>();
-  let iteration = 0;
-  const MAX_TERMINALS = 300; // safety cap
-
-  while (iteration < MAX_TERMINALS) {
-    // Read Table2 and Table3 for the current terminal
-    const termData = await page.evaluate(() => {
-      function cellText(el: Element | null): string {
-        return (el?.textContent ?? "").replace(/\s+/g, " ").trim();
-      }
-      function parseDollar(raw: string): number | null {
-        const n = parseFloat(raw.replace(/[$,\s]/g, ""));
-        return isNaN(n) ? null : n;
-      }
-      function parseDate(raw: string): string | null {
-        const t = raw.trim();
-        return t || null;
-      }
-
-      // ---- Table2: Merchant Information ----
-      // Columns (0-based): Terminal ID, Location Name, Address, City,
-      //                     State/Province, Postal Code, Telephone, Contact, Property Type
-      // Avoid :has() — iterate rows for compatibility with older Chrome builds
-      let t2DataCells: Element[] = [];
-      let t2Headers: string[] = [];
-      const table2 = document.querySelector<HTMLTableElement>("#Table2");
-      if (table2) {
-        for (const row of Array.from(table2.querySelectorAll("tr"))) {
-          const dataCells = Array.from(row.querySelectorAll("td.tmdata"));
-          const headerCells = Array.from(row.querySelectorAll("td.tmdatalabel"));
-          if (dataCells.length >= 3 && t2DataCells.length === 0) {
-            t2DataCells = Array.from(row.querySelectorAll("td")); // all cells in data row
-          }
-          if (headerCells.length >= 3 && t2Headers.length === 0) {
-            t2Headers = headerCells.map(h => cellText(h).toLowerCase());
-          }
-        }
-      }
-
-      if (t2DataCells.length === 0) return null;
-
-      function t2ColIdx(keyword: string): number {
-        const k = keyword.toLowerCase();
-        const idx = t2Headers.findIndex(h => h.includes(k));
-        return idx >= 0 ? idx : -1;
-      }
-
-      // Column indices with fallbacks
-      const colTerminalId   = t2ColIdx("terminal id") >= 0 ? t2ColIdx("terminal id") : 0;
-      const colLocationName = t2ColIdx("location")    >= 0 ? t2ColIdx("location")    : 1;
-      const colAddress      = t2ColIdx("address")     >= 0 ? t2ColIdx("address")     : 2;
-      const colCity         = t2ColIdx("city")        >= 0 ? t2ColIdx("city")        : 3;
-      const colState        = t2ColIdx("state")       >= 0 ? t2ColIdx("state")       : 4;
-      const colPostal       = t2ColIdx("postal")      >= 0 ? t2ColIdx("postal")      : 5;
-      const colPropType     = t2ColIdx("property")    >= 0 ? t2ColIdx("property")    : 8;
-
-      const terminalId   = cellText(t2DataCells[colTerminalId] ?? t2DataCells[0]);
-      const locationName = t2DataCells[colLocationName] ? cellText(t2DataCells[colLocationName]) || null : null;
-      const address      = t2DataCells[colAddress]      ? cellText(t2DataCells[colAddress])      || null : null;
-      const city         = t2DataCells[colCity]         ? cellText(t2DataCells[colCity])         || null : null;
-      const state        = t2DataCells[colState]        ? cellText(t2DataCells[colState])        || null : null;
-      const postalCode   = t2DataCells[colPostal]       ? cellText(t2DataCells[colPostal])       || null : null;
-      const propertyType = t2DataCells[colPropType]     ? cellText(t2DataCells[colPropType])     || null : null;
-
-      // ---- Surcharge from litCurrentSurchargePanel ----
-      const surchargeText = cellText(document.querySelector("#litCurrentSurchargePanel"));
-      const surchargeMatch = surchargeText.match(/\$?([\d,]+\.?\d*)/);
-      const surcharge = surchargeMatch ? parseDollar(surchargeMatch[0]) : null;
-
-      // ---- Table3: Terminal Status ----
-      // Columns: Make/Model, Comm Type, Current Balance, Last Error,
-      //          Last Contact, Last Message, Last App W/D, Install Date
-      // Avoid :has() — iterate rows for compatibility
-      let t3DataCells: Element[] = [];
-      let t3Headers: string[] = [];
-      const table3 = document.querySelector<HTMLTableElement>("#Table3");
-      if (table3) {
-        for (const row of Array.from(table3.querySelectorAll("tr"))) {
-          const dataCells = Array.from(row.querySelectorAll("td.tmdata"));
-          const headerCells = Array.from(row.querySelectorAll("td.tmdatalabel"));
-          if (dataCells.length >= 2 && t3DataCells.length === 0) {
-            t3DataCells = Array.from(row.querySelectorAll("td")); // all cells in data row
-          }
-          if (headerCells.length >= 2 && t3Headers.length === 0) {
-            t3Headers = headerCells.map(h => cellText(h).toLowerCase());
-          }
-        }
-      }
-
-      function t3ColIdx(keyword: string): number {
-        const k = keyword.toLowerCase();
-        const idx = t3Headers.findIndex(h => h.includes(k));
-        return idx >= 0 ? idx : -1;
-      }
-
-      const colMakeModel   = t3ColIdx("make")    >= 0 ? t3ColIdx("make")    : 0;
-      const colBalance     = t3ColIdx("balance")  >= 0 ? t3ColIdx("balance") : 2;
-      const colLastContact = t3ColIdx("contact")  >= 0 ? t3ColIdx("contact") : 4;
-
-      // Prefer the dedicated #curbalid element for balance
-      const balanceEl = document.querySelector("#curbalid");
-      const balanceRaw = balanceEl ? cellText(balanceEl) : (t3DataCells[colBalance] ? cellText(t3DataCells[colBalance]) : "");
-      const currentBalance = parseDollar(balanceRaw);
-
-      const makeModel  = t3DataCells[colMakeModel]   ? cellText(t3DataCells[colMakeModel])   || null : null;
-      const lastContactRaw = t3DataCells[colLastContact] ? cellText(t3DataCells[colLastContact]) : "";
-      const lastContact = parseDate(lastContactRaw);
-
-      // isOnline: last contact within 48h
-      let isOnline = false;
-      if (lastContact) {
-        const d = new Date(lastContact);
-        if (!isNaN(d.getTime())) isOnline = Date.now() - d.getTime() < 48 * 3_600_000;
-      }
-
-      return {
-        terminalId,
-        locationName,
-        address,
-        city,
-        state,
-        postalCode,
-        propertyType,
-        makeModel,
-        surcharge,
-        currentBalance,
-        lastContact,
-        isOnline,
-      };
-    });
-
-    if (!termData || !termData.terminalId) {
-      logger.warn({ iteration }, "Columbus Data: could not read terminal data from Table2, stopping");
-      break;
-    }
-
-    const { terminalId } = termData;
-
-    // Loop detection
-    if (seenIds.has(terminalId)) {
-      logger.info({ terminalId, iteration, total: results.length }, "Columbus Data: loop detected (terminal seen before), stopping");
-      break;
-    }
-    seenIds.add(terminalId);
-
-    results.push({
-      terminalId,
-      terminalLabel: termData.locationName ? `${terminalId} - ${termData.locationName}` : terminalId,
-      locationName: termData.locationName,
-      address: termData.address,
-      city: termData.city,
-      state: termData.state,
-      postalCode: termData.postalCode,
-      propertyType: termData.propertyType,
-      makeModel: termData.makeModel,
-      surcharge: termData.surcharge,
-      currentBalance: termData.currentBalance,
-      lastContact: termData.lastContact,
-      isOnline: termData.isOnline,
-    });
-
-    logger.info(
-      { terminalId, balance: termData.currentBalance, postalCode: termData.postalCode, propertyType: termData.propertyType, iteration },
-      "Columbus Data: scraped terminal"
-    );
-
-    // Click Next Terminal
-    const nextClicked = await page.evaluate(() => {
-      const btn = document.querySelector<HTMLElement>("#btnNext");
-      if (btn) { btn.click(); return true; }
-      return false;
-    });
-
-    if (!nextClicked) {
-      logger.info("Columbus Data: #btnNext not found, stopping");
-      break;
-    }
-
-    // Wait for Table2 to update to a new terminal ID
-    try {
-      await page.waitForFunction(
-        (prevId: string) => {
-          const cells = document.querySelectorAll("#Table2 td.tmdata");
-          if (!cells[0]) return false;
-          const cur = (cells[0].textContent ?? "").replace(/\s+/g, " ").trim();
-          return cur !== "" && cur !== prevId;
-        },
-        { timeout: 15_000 },
-        terminalId,
-      );
-    } catch {
-      logger.warn({ terminalId, iteration }, "Columbus Data: timed out waiting for next terminal, stopping");
-      break;
-    }
-
-    // Small buffer for UpdatePanel to fully settle
-    await new Promise(r => setTimeout(r, 500));
-    iteration++;
-  }
-
-  logger.info({ scraped: results.length, iterations: iteration }, "Columbus Data: TermIDStatus cycle complete");
-  return results;
+interface ReportRow {
+  terminalId: string;
+  locationName: string | null;
+  address: string | null;
+  city: string | null;
+  state: string | null;
+  postalCode: string | null;
+  propertyType: string | null;
+  makeModel: string | null;
+  surcharge: number | null;
 }
 
-// ---------------------------------------------------------------------------
-// FALLBACK: Proven grid + Active Terminals report approach
-// ---------------------------------------------------------------------------
+async function scrapeReportTable(
+  page: Page,
+  url: string,
+  reportName: string,
+): Promise<Map<string, ReportRow>> {
+  logger.info({ url }, `Columbus Data: scraping ${reportName}`);
 
-async function scrapeViaGridAndReport(page: Page): Promise<ColumbusTerminalStatus[]> {
-  // Active Terminals report — location, address, make/model, surcharge
-  const activeTerminalsMap = await scrapeActiveTerminalsReport(page);
-  logger.info({ count: activeTerminalsMap.size }, "Columbus Data (fallback): active terminals report done");
+  // Navigate — fire-and-forget is safe here since we waitForSelector next
+  page.goto(url).catch(() => {});
 
-  // Status Report grid — balance, last contact, online status
-  logger.info("Columbus Data (fallback): navigating to status report grid");
-  page.goto(REPORT_URL).catch(() => {});
+  // Wait for any table to appear
+  await page.waitForSelector("table", { timeout: 20_000 }).catch(() => {});
 
-  const gridFound = await page
-    .waitForSelector("table[id*='rgTermStatusReport']", { timeout: 45_000 })
-    .then(() => true).catch(() => false);
-
-  if (!gridFound) {
-    const html = await page.evaluate(() => document.body?.innerHTML?.slice(0, 2000) ?? "");
-    logger.warn({ html }, "Columbus Data (fallback): grid not found");
-    throw new Error("Columbus Data: status report grid not found after 45s");
-  }
-
-  // Try to expand page size
-  try {
-    const sizeInput = await page.$("#rgTermStatusReport_ctl00_ctl03_ctl01_PageSizeComboBox_Input");
-    if (sizeInput) {
-      await sizeInput.click({ clickCount: 3 });
-      await sizeInput.type("500");
-      await sizeInput.press("Enter");
-      await new Promise(r => setTimeout(r, 3_000));
-    }
-  } catch { /* ignore */ }
-
-  const gridRows = await scrapeStatusGrid(page);
-  logger.info({ count: gridRows.length }, "Columbus Data (fallback): scraped grid rows");
-
-  if (gridRows.length === 0) {
-    throw new Error("Columbus Data: no terminal rows found in status report grid");
-  }
-
-  // Merge and return
-  const results: ColumbusTerminalStatus[] = gridRows.map(row => {
-    const info = activeTerminalsMap.get(row.terminalId);
-    return {
-      terminalId: row.terminalId,
-      terminalLabel: row.terminalLabel,
-      locationName: info?.locationName ?? null,
-      address: info?.address ?? null,
-      city: info?.city ?? null,
-      state: info?.state ?? null,
-      makeModel: info?.makeModel ?? null,
-      surcharge: info?.surcharge ?? null,
-      postalCode: null,
-      propertyType: null,
-      currentBalance: row.currentBalance,
-      lastContact: row.lastContact,
-      isOnline: row.isOnline,
-    };
-  });
-
-  // Deduplicate
-  const seen = new Set<string>();
-  const deduped = results.filter(r => {
-    if (seen.has(r.terminalId)) return false;
-    seen.add(r.terminalId);
-    return true;
-  });
-
-  logger.info({ scraped: results.length, deduped: deduped.length }, "Columbus Data (fallback): sync complete");
-  return deduped;
-}
-
-// ---------------------------------------------------------------------------
-// Active Terminals report helper (fallback path only)
-// ---------------------------------------------------------------------------
-
-async function scrapeActiveTerminalsReport(page: Page): Promise<Map<string, ActiveTerminalInfo>> {
-  logger.info({ url: ACTIVE_TERMS_URL }, "Columbus Data: navigating to active terminals report");
-  page.goto(ACTIVE_TERMS_URL).catch(() => {});
-
-  const tableAppeared = await page.waitForSelector("table", { timeout: 20_000 })
-    .then(() => true).catch(() => false);
-
+  // Click a View Report / Submit / Run button if present (needed for ReportViewer.aspx)
   const clicked = await page.evaluate(() => {
     const btn = Array.from(document.querySelectorAll<HTMLElement>(
       "input[type=submit], button, input[type=button]"
-    )).find(el => /view|submit|run|generate/i.test(
+    )).find(el => /view|submit|run|generate|get/i.test(
       (el as HTMLInputElement).value ?? (el as HTMLButtonElement).innerText ?? ""
     ));
     if (btn) { btn.click(); return true; }
     return false;
   }).catch(() => false);
 
-  if (clicked || !tableAppeared) {
-    await page.waitForSelector("table", { timeout: 20_000 }).catch(() => {});
+  if (clicked) {
+    // Wait for the report table to load after clicking
+    await page.waitForSelector("table", { timeout: 25_000 }).catch(() => {});
+    await new Promise(r => setTimeout(r, 2_000));
   }
 
-  const scrapeTable = async (ctx: Page | import("puppeteer").Frame) => {
+  // Scrape the table — try main frame then iframes
+  const scrapeTable = async (ctx: Page | import("puppeteer").Frame): Promise<ReportRow[] | null> => {
     return ctx.evaluate(() => {
       function cellText(el: Element): string {
         return (el.textContent ?? "").replace(/\s+/g, " ").trim();
@@ -462,95 +238,111 @@ async function scrapeActiveTerminalsReport(page: Page): Promise<Map<string, Acti
         return isNaN(n) ? null : n;
       }
 
+      // Find the largest table that mentions "terminal"
       const tables = Array.from(document.querySelectorAll("table"));
       let best: HTMLTableElement | null = null;
       for (const t of tables) {
         const text = (t.textContent ?? "").toLowerCase();
-        if ((text.includes("terminal") || text.includes("location")) && t.rows.length > 3) {
+        if (t.rows.length > 3 && (text.includes("terminal") || text.includes("location") || text.includes("property"))) {
           if (!best || t.rows.length > best.rows.length) best = t;
         }
       }
       if (!best) return null;
 
+      // Find the header row — look for a row with at least 3 th/td headers
       const allRows = Array.from(best.querySelectorAll("tr"));
       const headerRow = allRows.find(r => {
         const t = (r.textContent ?? "").toLowerCase().replace(/\s+/g, "");
-        return t.includes("terminal") && (t.includes("address") || t.includes("location") || t.includes("surcharge") || t.includes("city"));
+        return t.includes("terminal") && (
+          t.includes("address") || t.includes("location") || t.includes("postal") ||
+          t.includes("property") || t.includes("surcharge") || t.includes("city") ||
+          t.includes("type")
+        );
       });
       if (!headerRow) return null;
 
       const headers = Array.from(headerRow.querySelectorAll("th, td"))
-        .map(h => cellText(h).toLowerCase());
-      const idx = (kw: string) => {
-        const n = kw.replace(/\s+/g, "");
-        return headers.findIndex(h => h.replace(/\s+/g, "").includes(n));
-      };
+        .map(h => cellText(h).toLowerCase().replace(/\s+/g, ""));
 
-      const termIdIdx    = idx("terminalid") !== -1 ? idx("terminalid") : idx("termid") !== -1 ? idx("termid") : 0;
-      const nameIdx      = idx("locationname") !== -1 ? idx("locationname") : idx("location") !== -1 ? idx("location") : 2;
-      const addressIdx   = idx("address") !== -1 ? idx("address") : 3;
-      const cityIdx      = idx("city") !== -1 ? idx("city") : 5;
-      const stateIdx     = idx("state") !== -1 ? idx("state") : 6;
-      const modelIdx     = idx("machinetype") !== -1 ? idx("machinetype") : idx("model") !== -1 ? idx("model") : -1;
-      const surchargeIdx = idx("surcharge") !== -1 ? idx("surcharge") : -1;
+      function colIdx(keyword: string): number {
+        const k = keyword.toLowerCase().replace(/\s+/g, "");
+        return headers.findIndex(h => h.includes(k));
+      }
+
+      const idxTerminal   = colIdx("terminalid") >= 0 ? colIdx("terminalid") : colIdx("termid") >= 0 ? colIdx("termid") : 0;
+      const idxLocation   = colIdx("locationname") >= 0 ? colIdx("locationname") : colIdx("location") >= 0 ? colIdx("location") : -1;
+      const idxAddress    = colIdx("address");
+      const idxCity       = colIdx("city");
+      const idxState      = colIdx("state") >= 0 ? colIdx("state") : colIdx("province");
+      const idxPostal     = colIdx("postal") >= 0 ? colIdx("postal") : colIdx("zip");
+      const idxPropType   = colIdx("propertytype") >= 0 ? colIdx("propertytype") : colIdx("property") >= 0 ? colIdx("property") : colIdx("type") >= 0 ? colIdx("type") : -1;
+      const idxMakeModel  = colIdx("machinetype") >= 0 ? colIdx("machinetype") : colIdx("makemodel") >= 0 ? colIdx("makemodel") : colIdx("model") >= 0 ? colIdx("model") : colIdx("make") >= 0 ? colIdx("make") : -1;
+      const idxSurcharge  = colIdx("surcharge");
 
       const result: {
-        terminalId: string; locationName: string | null; address: string | null;
-        city: string | null; state: string | null; makeModel: string | null; surcharge: number | null;
+        terminalId: string;
+        locationName: string | null; address: string | null; city: string | null;
+        state: string | null; postalCode: string | null; propertyType: string | null;
+        makeModel: string | null; surcharge: number | null;
       }[] = [];
 
       const headerIdx = allRows.indexOf(headerRow);
       for (let i = headerIdx + 1; i < allRows.length; i++) {
         const cells = Array.from(allRows[i].querySelectorAll("td"));
-        if (cells.length < 3) continue;
-        const terminalId = cellText(cells[termIdIdx] ?? cells[0]);
-        if (!terminalId || /active terminal|terminal id|^total/i.test(terminalId)) continue;
+        if (cells.length < 2) continue;
+
+        const terminalId = cellText(cells[idxTerminal] ?? cells[0]);
+        if (!terminalId || /terminal\s*id|^total|^grand/i.test(terminalId)) continue;
+
+        function getCell(idx: number): string | null {
+          if (idx < 0 || idx >= cells.length) return null;
+          return cellText(cells[idx]) || null;
+        }
 
         result.push({
           terminalId,
-          locationName: nameIdx < cells.length ? cellText(cells[nameIdx]) || null : null,
-          address:      addressIdx < cells.length ? cellText(cells[addressIdx]) || null : null,
-          city:         cityIdx < cells.length ? cellText(cells[cityIdx]) || null : null,
-          state:        stateIdx < cells.length ? cellText(cells[stateIdx]) || null : null,
-          makeModel:    modelIdx >= 0 && modelIdx < cells.length ? cellText(cells[modelIdx]) || null : null,
-          surcharge:    surchargeIdx >= 0 && cells[surchargeIdx]
-            ? parseDollar(cellText(cells[surchargeIdx]))
-            : null,
+          locationName: getCell(idxLocation),
+          address:      getCell(idxAddress),
+          city:         getCell(idxCity),
+          state:        getCell(idxState),
+          postalCode:   getCell(idxPostal),
+          propertyType: getCell(idxPropType),
+          makeModel:    getCell(idxMakeModel),
+          surcharge:    idxSurcharge >= 0 && cells[idxSurcharge] ? parseDollar(cellText(cells[idxSurcharge])) : null,
         });
       }
+
       return result.length > 0 ? result : null;
     });
   };
 
   let rows = await scrapeTable(page).catch(() => null);
-  if (!rows) {
+
+  // Try iframes if main frame had no results
+  if (!rows || rows.length === 0) {
     for (const frame of page.frames()) {
       if (frame === page.mainFrame()) continue;
       rows = await scrapeTable(frame as any).catch(() => null);
-      if (rows) break;
+      if (rows && rows.length > 0) break;
     }
   }
 
-  logger.info({ count: rows?.length ?? 0, sample: rows?.[0] ?? null }, "Columbus Data: active terminals report scraped");
+  logger.info(
+    { report: reportName, count: rows?.length ?? 0, sample: rows?.[0] ?? null },
+    "Columbus Data: report table scraped"
+  );
 
-  const infoMap = new Map<string, ActiveTerminalInfo>();
+  const map = new Map<string, ReportRow>();
   for (const row of rows ?? []) {
     if (row.terminalId) {
-      infoMap.set(row.terminalId, {
-        locationName: row.locationName,
-        address: row.address,
-        city: row.city,
-        state: row.state,
-        makeModel: row.makeModel,
-        surcharge: row.surcharge,
-      });
+      map.set(row.terminalId, row);
     }
   }
-  return infoMap;
+  return map;
 }
 
 // ---------------------------------------------------------------------------
-// Status Report grid helper (fallback path only)
+// TerminalStatusReport.aspx grid — terminal IDs, balance, last contact
 // ---------------------------------------------------------------------------
 
 interface GridRow {
