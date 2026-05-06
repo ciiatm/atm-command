@@ -41,8 +41,33 @@ export default function PortalsPage() {
   const [editingId, setEditingId] = useState<number | null>(null);
   const [form, setForm] = useState<PortalForm>(emptyPortal);
   const [syncingId, setSyncingId] = useState<number | null>(null);
+  const pollRef = useState<ReturnType<typeof setInterval> | null>(null);
 
   const { data: portals = [], refetch } = useListPortals();
+  const { data: history = [], refetch: refetchHistory } = useGetPortalSyncHistory();
+
+  // Poll every 5s while a background sync is in progress
+  const startPolling = (portalId: number, startedAt: Date) => {
+    if (pollRef[0]) clearInterval(pollRef[0]);
+    const interval = setInterval(async () => {
+      await refetch();
+      await refetchHistory();
+      // Check if a new history entry appeared since we started
+      const portal = portals.find(p => p.id === portalId);
+      if (portal?.lastSynced && new Date(portal.lastSynced) > startedAt) {
+        clearInterval(interval);
+        pollRef[1](null);
+        setSyncingId(null);
+        if (portal.lastSyncStatus === "success") {
+          toast({ title: "Sync complete — ATM fleet updated" });
+        } else {
+          toast({ title: "Sync failed", description: portal.lastSyncStatus ?? "", variant: "destructive" });
+        }
+      }
+    }, 5_000);
+    pollRef[1](interval);
+  };
+
   const createPortal = useCreatePortal({
     mutation: {
       onSuccess: () => { refetch(); setShowAdd(false); setForm(emptyPortal); toast({ title: "Portal added" }); },
@@ -58,12 +83,16 @@ export default function PortalsPage() {
   const syncPortal = useSyncPortal({
     mutation: {
       onMutate: (vars) => setSyncingId(vars.id),
-      onSuccess: (data) => {
-        refetch();
-        setSyncingId(null);
-        if ((data as any).success === false) {
+      onSuccess: (data, vars) => {
+        if ((data as any).background) {
+          // Sync is running in background — poll until it completes
+          toast({ title: "Syncing…", description: "Running in background, this may take a minute." });
+          startPolling(vars.id, new Date());
+        } else if ((data as any).success === false) {
+          setSyncingId(null);
           toast({ title: "Sync failed", description: (data as any).message ?? "Unknown error", variant: "destructive" });
         } else {
+          refetch(); refetchHistory(); setSyncingId(null);
           toast({ title: `Sync complete: ${data.atmsUpdated} ATMs updated` });
         }
       },
@@ -74,7 +103,6 @@ export default function PortalsPage() {
       }
     }
   });
-  const { data: history = [] } = useGetPortalSyncHistory();
 
   return (
     <div>

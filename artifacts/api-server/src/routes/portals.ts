@@ -167,43 +167,47 @@ router.post("/portals/:id/sync", async (req, res) => {
     return;
   }
 
+  // Return immediately — the real scrape runs in the background.
+  // The ALB has a 60s idle timeout; Puppeteer scrapes take longer.
+  // The frontend polls sync history to see when it completes.
+  res.json({
+    portalId: portal.id,
+    portalName: PORTAL_CONFIG[portal.name]?.displayName ?? portal.name,
+    success: true,
+    message: "Sync started in background",
+    atmsUpdated: 0,
+    alertsCreated: 0,
+    syncedAt: new Date().toISOString(),
+    background: true,
+  });
+
+  // Run the actual sync after response is sent
+  runSyncInBackground(portal);
+});
+
+async function runSyncInBackground(portal: {
+  id: number; name: string; username: string; passwordEncrypted: string; syncIntervalHours: number;
+}) {
   let result: { success: boolean; message: string; atmsUpdated: number; alertsCreated: number };
   try {
     result = await performPortalSync(portal);
   } catch (err) {
-    // Unhandled exception (e.g. puppeteer module not found, chromium crash)
     const message = err instanceof Error ? err.message : String(err);
     result = { success: false, message, atmsUpdated: 0, alertsCreated: 0 };
   }
 
-  // Update portal sync status
   await db
     .update(portalsTable)
-    .set({
-      lastSynced: new Date(),
-      lastSyncStatus: result.success ? "success" : "failed",
-    })
+    .set({ lastSynced: new Date(), lastSyncStatus: result.success ? "success" : "failed" })
     .where(eq(portalsTable.id, portal.id));
 
-  // Log sync history
   await db.insert(portalSyncHistoryTable).values({
     portalId: portal.id,
     success: result.success,
     message: result.message,
     atmsUpdated: result.atmsUpdated,
   });
-
-  // Always return 200 so the frontend receives the message
-  res.json({
-    portalId: portal.id,
-    portalName: PORTAL_CONFIG[portal.name]?.displayName ?? portal.name,
-    success: result.success,
-    message: result.message,
-    atmsUpdated: result.atmsUpdated,
-    alertsCreated: result.alertsCreated,
-    syncedAt: new Date().toISOString(),
-  });
-});
+}
 
 router.post("/portals/sync-all", async (req, res) => {
   const portals = await db
