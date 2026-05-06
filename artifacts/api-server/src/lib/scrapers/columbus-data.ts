@@ -128,37 +128,40 @@ export async function scrapeColumbusData(
     );
     logger.info({ inputFields }, "Columbus Data: login page inputs");
 
-    // Find username field — try specific IDs first, then fall back to
-    // the first visible text/email input on the page
+    // Find username field — Columbus Data uses #UsernameTextbox
     const userSelector = await findInputSelector(page, [
+      "#UsernameTextbox",
       "#txtUserName",
       "#txtUsername",
       "#UserName",
+      "input[name='UsernameTextbox']",
       "input[name*='UserName']",
       "input[name*='userName']",
-      "input[name*='username']",
-      "input[type='text']:not([type='hidden'])",
+      "input[type='text']",
       "input[type='email']",
     ]);
     if (!userSelector) throw new Error("Columbus Data: could not find username field on login page");
 
     const passSelector = await findInputSelector(page, [
+      "#PasswordTextbox",
       "#txtPassword",
       "#Password",
+      "input[name='PasswordTextbox']",
       "input[name*='Password']",
-      "input[name*='password']",
       "input[type='password']",
     ]);
     if (!passSelector) throw new Error("Columbus Data: could not find password field on login page");
 
-    // Find submit button
+    // Find submit button — Columbus Data uses #LoginButton
     const submitSelector = await findInputSelector(page, [
+      "#LoginButton",
       "#btnLogin",
       "#btnSubmit",
+      "input[name='LoginButton']",
       "input[type='submit']",
       "button[type='submit']",
+      "input[value*='Logon']",
       "input[value*='Login']",
-      "input[value*='Sign']",
     ]);
     if (!submitSelector) throw new Error("Columbus Data: could not find login button");
 
