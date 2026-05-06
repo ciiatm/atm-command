@@ -26,7 +26,7 @@ import { logger } from "../logger.js";
 const LOGIN_URL    = "https://www.columbusdata.net/cdswebtool/login/login.aspx";
 const TERM_LIST_URL = "https://www.columbusdata.net/cdswebtool/QuickView/TerminalStatusReport.aspx";
 const TERM_STATUS_URL = "https://www.columbusdata.net/cdswebtool/QuickView/TermIDStatus.aspx";
-const CONCURRENCY  = 5;
+const CONCURRENCY  = 3; // keep low — single-process Chromium shares one renderer
 
 export interface ColumbusTerminalStatus {
   terminalId: string;
@@ -175,17 +175,49 @@ async function scrapeTerminalIdList(page: Page): Promise<string[]> {
 }
 
 // ---------------------------------------------------------------------------
-// Step 3: Process a batch of terminals on one page (sequential within page)
+// Step 3: Navigate to TermIDStatus.aspx and scrape each terminal in sequence
 // ---------------------------------------------------------------------------
 
 async function processChunk(page: Page, terminalIds: string[]): Promise<(ColumbusTerminalStatus | null)[]> {
   const results: (ColumbusTerminalStatus | null)[] = [];
 
-  // Navigate to TermIDStatus.aspx once per worker page
-  page.goto(TERM_STATUS_URL).catch(() => {});
-  await page
-    .waitForSelector("#Table2, input[id*='radTerminalSelector']", { timeout: 30_000 })
-    .catch(() => {});
+  // Navigate properly — fire-and-forget causes race conditions with subsequent navigations
+  logger.info("Columbus Data: worker page navigating to TermIDStatus.aspx");
+  try {
+    await page.goto(TERM_STATUS_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
+  } catch {
+    // ASP.NET pages sometimes don't reach domcontentloaded cleanly; fall back to selector wait
+    await page.waitForSelector("#Table2, input[id*='radTerminalSelector_Input']", { timeout: 20_000 }).catch(() => {});
+  }
+
+  // Log what the page looks like so we can debug selector issues in production
+  const pageState = await page.evaluate(() => {
+    const allInputIds = Array.from(document.querySelectorAll("input[id]"))
+      .map(el => el.id).filter(Boolean);
+    const allBtnValues = Array.from(document.querySelectorAll<HTMLInputElement>(
+      "input[type=submit], input[type=button]"
+    )).map(el => `${el.id}:${el.value}`);
+    const dropdownIds = Array.from(document.querySelectorAll("[id*='DropDown'], [id*='dropdown']"))
+      .map(el => el.id);
+    const currentTermId = (document.querySelector("#Table2")
+      ?.querySelectorAll("tr")[2]?.querySelectorAll("td")[0]?.textContent ?? "").trim();
+    return {
+      hasTable2: !!document.querySelector("#Table2"),
+      hasTable3: !!document.querySelector("#Table3"),
+      currentTermId,
+      allInputIds,
+      allBtnValues,
+      dropdownIds,
+      url: location.href,
+    };
+  }).catch(() => null);
+
+  logger.info({ pageState }, "Columbus Data: TermIDStatus page state");
+
+  if (!pageState?.hasTable2 && !pageState?.allInputIds?.some(id => id.toLowerCase().includes("terminal"))) {
+    logger.warn("Columbus Data: TermIDStatus.aspx has no Table2 and no terminal selector — chunk will return empty");
+    return terminalIds.map(() => null);
+  }
 
   for (const termId of terminalIds) {
     try {
@@ -202,86 +234,136 @@ async function processChunk(page: Page, terminalIds: string[]): Promise<(Columbu
 }
 
 // ---------------------------------------------------------------------------
-// Scrape one terminal: try URL param, fall back to dropdown
+// Scrape one terminal via dropdown selection
 // ---------------------------------------------------------------------------
 
 async function scrapeTerminal(page: Page, termId: string): Promise<ColumbusTerminalStatus | null> {
-  // Attempt 1: URL parameter navigation
-  page.goto(`${TERM_STATUS_URL}?TermID=${encodeURIComponent(termId)}`).catch(() => {});
-  const appeared = await page.waitForSelector("#Table2", { timeout: 12_000 })
-    .then(() => true).catch(() => false);
+  // Check if this terminal is already displayed (saves one dropdown interaction)
+  const currentId = await page.evaluate(() => {
+    return (document.querySelector("#Table2")
+      ?.querySelectorAll("tr")[2]?.querySelectorAll("td")[0]?.textContent ?? "").trim();
+  }).catch(() => "");
 
-  if (appeared) {
-    const idInPage = await page.evaluate(() => {
-      const rows = document.querySelector("#Table2")?.querySelectorAll("tr");
-      return (rows?.[2]?.querySelectorAll("td")?.[0]?.textContent ?? "").trim();
-    });
-    if (idInPage === termId) {
-      return extractTerminalData(page, termId);
-    }
-    logger.debug({ termId, found: idInPage }, "Columbus Data: URL param ignored, falling back to dropdown");
+  if (currentId === termId) {
+    logger.debug({ termId }, "Columbus Data: terminal already displayed, scraping directly");
+    return extractTerminalData(page, termId);
   }
 
-  // Attempt 2: Telerik dropdown + Get Status button
+  // Use the dropdown to select this terminal
   const selected = await selectViaDropdown(page, termId);
   if (!selected) {
-    logger.warn({ termId }, "Columbus Data: could not select terminal via dropdown");
+    logger.warn({ termId }, "Columbus Data: dropdown selection failed");
     return null;
   }
   return extractTerminalData(page, termId);
 }
 
 async function selectViaDropdown(page: Page, termId: string): Promise<boolean> {
-  const inputSel = "input[id*='radTerminalSelector_Input'], input[id*='TerminalSelector_Input']";
-  const input = await page.$(inputSel);
-  if (!input) return false;
+  // Find the input — log its actual ID for debugging
+  const inputInfo = await page.evaluate(() => {
+    // Look for any input that looks like a terminal selector
+    const candidates = Array.from(document.querySelectorAll<HTMLInputElement>(
+      "input[id*='Terminal'], input[id*='terminal'], input[id*='terminalSelector'], input[id*='radTerminal']"
+    ));
+    return candidates.map(el => ({ id: el.id, value: el.value, type: el.type }));
+  });
+  logger.debug({ termId, inputInfo }, "Columbus Data: dropdown input candidates");
 
-  // Clear the current value and type the terminal ID to filter
+  const inputSel = [
+    "input[id*='radTerminalSelector_Input']",
+    "input[id*='TerminalSelector_Input']",
+    "input[id*='terminalSelector_Input']",
+    "input[id*='Terminal_Input']",
+  ].join(", ");
+
+  const input = await page.$(inputSel);
+  if (!input) {
+    logger.warn({ termId, inputSel }, "Columbus Data: no dropdown input matched selector");
+    return false;
+  }
+
+  const inputId = await input.evaluate(el => el.id);
+  logger.debug({ termId, inputId }, "Columbus Data: using input element");
+
+  // Clear and type the terminal ID to filter the dropdown
   await input.click({ clickCount: 3 });
   await page.keyboard.press("Backspace");
-  await input.type(termId, { delay: 40 });
-  await new Promise(r => setTimeout(r, 1_500));
+  await input.type(termId, { delay: 50 });
+  await new Promise(r => setTimeout(r, 1_000));
 
-  // Click the matching dropdown item
-  const clicked = await page.evaluate((id) => {
-    const selectors = [
-      "[id*='radTerminalSelector_DropDown'] li",
-      "[id*='TerminalSelector_DropDown'] li",
-      ".rcbList li",
-    ];
-    for (const sel of selectors) {
-      for (const item of document.querySelectorAll(sel)) {
-        if ((item.textContent ?? "").trim().startsWith(id)) {
-          (item as HTMLElement).click();
-          return true;
-        }
+  // Try to open the dropdown by clicking the arrow button (some Telerik ComboBoxes require this)
+  await page.evaluate(() => {
+    const arrow = document.querySelector<HTMLElement>(
+      "a[class*='rcbArrow'], .rcbArrowCell a, [id*='Arrow'], button[class*='arrow']"
+    );
+    if (arrow) arrow.click();
+  });
+  await new Promise(r => setTimeout(r, 800));
+
+  // Find and click the matching item in the dropdown list
+  const clickResult = await page.evaluate((id) => {
+    // Log all visible dropdown items for debugging
+    const allItems = Array.from(document.querySelectorAll(
+      "li[id*='Terminal'], li[id*='terminal'], .rcbList li, .rcbItem, [id*='DropDown'] li, [class*='DropDown'] li, [id*='dropDown'] li"
+    )).map(el => ({ id: (el as HTMLElement).id, text: (el.textContent ?? "").trim().slice(0, 40) }));
+
+    // Try to click the one matching our terminal ID
+    for (const item of document.querySelectorAll(
+      "[id*='DropDown'] li, [id*='dropDown'] li, .rcbList li, .rcbItem, li[class*='rcb']"
+    )) {
+      const text = (item.textContent ?? "").trim();
+      if (text.startsWith(id) || text === id) {
+        (item as HTMLElement).click();
+        return { clicked: true, text, allItems };
       }
     }
-    return false;
+    return { clicked: false, allItems };
   }, termId);
 
-  if (!clicked) {
+  logger.debug({ termId, clickResult }, "Columbus Data: dropdown item search result");
+
+  if (!clickResult.clicked) {
+    // Item not found in open dropdown — press Enter to accept typed value
     await input.press("Enter");
-  }
-  await new Promise(r => setTimeout(r, 500));
-
-  // Click Get Status
-  const btn = await page.$("#btnGetStatus");
-  if (btn) {
-    await btn.click();
+    await new Promise(r => setTimeout(r, 500));
   } else {
-    await page.evaluate(() => {
-      const b = document.querySelector<HTMLElement>("input[value*='Status'], button[id*='Status']");
-      if (b) b.click();
-    });
+    await new Promise(r => setTimeout(r, 300));
   }
 
-  // Wait for Table2 to update to show the correct terminal
+  // Click the Get Status button — log what buttons are available if not found
+  const btnResult = await page.evaluate(() => {
+    const candidates = [
+      document.querySelector<HTMLElement>("#btnGetStatus"),
+      document.querySelector<HTMLElement>("input[value='Get Status']"),
+      document.querySelector<HTMLElement>("input[value*='Status']"),
+      document.querySelector<HTMLElement>("input[id*='GetStatus']"),
+      document.querySelector<HTMLElement>("input[id*='btnGet']"),
+    ].filter(Boolean) as HTMLElement[];
+
+    const allBtns = Array.from(document.querySelectorAll<HTMLInputElement>(
+      "input[type=submit], input[type=button]"
+    )).map(el => `${el.id}=${el.value}`);
+
+    if (candidates[0]) {
+      candidates[0].click();
+      return { clicked: true, id: (candidates[0] as HTMLInputElement).id, allBtns };
+    }
+    return { clicked: false, allBtns };
+  });
+
+  logger.debug({ termId, btnResult }, "Columbus Data: Get Status button result");
+
+  if (!btnResult.clicked) {
+    logger.warn({ termId, allBtns: btnResult.allBtns }, "Columbus Data: Get Status button not found");
+    return false;
+  }
+
+  // Wait for Table2 to update with the correct terminal
   try {
     await page.waitForFunction(
       (targetId: string) => {
-        const rows = document.querySelector("#Table2")?.querySelectorAll("tr");
-        const id = (rows?.[2]?.querySelectorAll("td")?.[0]?.textContent ?? "").trim();
+        const id = (document.querySelector("#Table2")
+          ?.querySelectorAll("tr")[2]?.querySelectorAll("td")[0]?.textContent ?? "").trim();
         return id === targetId;
       },
       { timeout: 15_000 },
@@ -289,7 +371,11 @@ async function selectViaDropdown(page: Page, termId: string): Promise<boolean> {
     );
     return true;
   } catch {
-    logger.warn({ termId }, "Columbus Data: Table2 did not update after dropdown selection");
+    const actualId = await page.evaluate(() =>
+      (document.querySelector("#Table2")?.querySelectorAll("tr")[2]
+        ?.querySelectorAll("td")[0]?.textContent ?? "").trim()
+    ).catch(() => "unknown");
+    logger.warn({ termId, actualId }, "Columbus Data: Table2 did not update to expected terminal after Get Status");
     return false;
   }
 }
