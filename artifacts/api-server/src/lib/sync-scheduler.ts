@@ -6,7 +6,7 @@
  */
 
 import { db } from "@workspace/db";
-import { portalsTable, portalSyncHistoryTable, atmsTable, alertsTable, atmTransactionLogTable } from "@workspace/db";
+import { portalsTable, portalSyncHistoryTable, atmsTable, alertsTable } from "@workspace/db";
 import { eq } from "drizzle-orm";
 import { logger } from "./logger.js";
 import { scrapeColumbusData } from "./scrapers/columbus-data.js";
@@ -53,8 +53,6 @@ async function syncPortal(portal: {
         else if (newBalance < (atm?.lowCashThreshold ?? 2000)) newStatus = "low_cash";
         else newStatus = "online";
 
-        let atmId: number | null = atm?.id ?? null;
-
         if (atm) {
           await db
             .update(atmsTable)
@@ -62,19 +60,18 @@ async function syncPortal(portal: {
               currentBalance: newBalance,
               status: newStatus,
               lastSynced: new Date(),
-              ...(ts.dailyCashDispensed != null ? { avgDailyDispensed: ts.dailyCashDispensed } : {}),
-              ...(ts.dailyTransactionCount != null ? { avgDailyTransactions: ts.dailyTransactionCount } : {}),
-              ...(ts.surcharge != null ? { surcharge: ts.surcharge } : {}),
               ...(ts.makeModel ? { makeModel: ts.makeModel } : {}),
               ...(ts.locationName ? { locationName: ts.locationName } : {}),
               ...(ts.address ? { address: ts.address } : {}),
               ...(ts.city ? { city: ts.city } : {}),
               ...(ts.state ? { state: ts.state } : {}),
+              ...(ts.postalCode ? { postalCode: ts.postalCode } : {}),
+              ...(ts.propertyType ? { propertyType: ts.propertyType } : {}),
             } as any)
             .where(eq(atmsTable.id, atm.id));
         } else {
           // Auto-create
-          const [created] = await db.insert(atmsTable).values({
+          await db.insert(atmsTable).values({
             name: ts.locationName || ts.terminalLabel || ts.terminalId,
             locationName: ts.locationName || ts.terminalLabel || ts.terminalId,
             address: ts.address || "Unknown",
@@ -86,9 +83,9 @@ async function syncPortal(portal: {
             status: newStatus,
             lastSynced: new Date(),
             ...(ts.makeModel ? { makeModel: ts.makeModel } : {}),
-            ...(ts.surcharge != null ? { surcharge: ts.surcharge } : {}),
+            ...(ts.postalCode ? { postalCode: ts.postalCode } : {}),
+            ...(ts.propertyType ? { propertyType: ts.propertyType } : {}),
           } as any).returning();
-          atmId = created?.id ?? null;
         }
 
         if (newStatus === "low_cash" || newStatus === "error") {
@@ -104,26 +101,6 @@ async function syncPortal(portal: {
             resolved: false,
           });
           alertsCreated++;
-        }
-
-        // Store individual transactions from Table5
-        if (atmId && ts.transactions.length > 0) {
-          for (const tx of ts.transactions) {
-            const txTs = new Date(tx.transactedAt);
-            if (isNaN(txTs.getTime())) continue;
-            await db
-              .insert(atmTransactionLogTable)
-              .values({
-                atmId,
-                transactedAt: txTs,
-                cardNumber: tx.cardNumber,
-                transactionType: tx.transactionType,
-                amount: tx.amount ?? 0,
-                response: tx.response,
-                terminalBalance: tx.terminalBalance,
-              })
-              .onConflictDoNothing();
-          }
         }
 
         atmsUpdated++;

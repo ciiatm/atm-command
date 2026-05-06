@@ -46,6 +46,8 @@ export const atmsTable = pgTable("atms", {
   avgDailyDispensed: real("avg_daily_dispensed"),
   surcharge: real("surcharge"),
   makeModel: text("make_model"),
+  postalCode: text("postal_code"),
+  propertyType: text("property_type"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 

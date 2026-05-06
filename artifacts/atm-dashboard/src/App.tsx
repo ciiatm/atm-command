@@ -14,6 +14,7 @@ import PortalsPage from "@/pages/portals";
 import BookkeepingPage from "@/pages/bookkeeping";
 import MileagePage from "@/pages/mileage";
 import PayrollPage from "@/pages/payroll";
+import TransactionsPage from "@/pages/transactions";
 
 const queryClient = new QueryClient();
 
@@ -30,6 +31,7 @@ function Router() {
         <Route path="/bookkeeping" component={BookkeepingPage} />
         <Route path="/mileage" component={MileagePage} />
         <Route path="/payroll" component={PayrollPage} />
+        <Route path="/transactions" component={TransactionsPage} />
         <Route component={NotFound} />
       </Switch>
     </Layout>

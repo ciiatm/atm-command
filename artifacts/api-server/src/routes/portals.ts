@@ -7,7 +7,7 @@ import {
   alertsTable,
   atmTransactionLogTable,
 } from "@workspace/db";
-import { eq, count, desc } from "drizzle-orm";
+import { eq, count, desc, isNotNull } from "drizzle-orm";
 import {
   CreatePortalBody,
   UpdatePortalParams,
@@ -16,6 +16,7 @@ import {
   SyncPortalParams,
 } from "@workspace/api-zod";
 import { scrapeColumbusData } from "../lib/scrapers/columbus-data.js";
+import { scrapeColumbusTransactions } from "../lib/scrapers/columbus-data-transactions.js";
 
 const PORTAL_CONFIG: Record<
   string,
@@ -185,6 +186,26 @@ router.post("/portals/:id/sync", async (req, res) => {
   runSyncInBackground(portal);
 });
 
+router.post("/portals/:id/sync-transactions", async (req, res) => {
+  const params = SyncPortalParams.safeParse({ id: Number(req.params.id) });
+  if (!params.success) {
+    res.status(400).json({ error: "Invalid id" });
+    return;
+  }
+  const [portal] = await db
+    .select()
+    .from(portalsTable)
+    .where(eq(portalsTable.id, params.data.id));
+  if (!portal) {
+    res.status(404).json({ error: "Portal not found" });
+    return;
+  }
+
+  res.json({ background: true, message: "Transaction sync started" });
+
+  runTransactionSyncInBackground(portal);
+});
+
 async function runSyncInBackground(portal: {
   id: number; name: string; username: string; passwordEncrypted: string; syncIntervalHours: number;
 }) {
@@ -208,6 +229,87 @@ async function runSyncInBackground(portal: {
     success: result.success,
     message: result.message,
     atmsUpdated: result.atmsUpdated,
+    durationSeconds,
+  });
+}
+
+async function runTransactionSyncInBackground(portal: {
+  id: number; name: string; username: string; passwordEncrypted: string;
+}) {
+  const startedAt = Date.now();
+  let success = false;
+  let message = "";
+  let atmsUpdated = 0;
+
+  try {
+    // Get all ATMs for this portal that have a portalAtmId
+    const atms = await db
+      .select()
+      .from(atmsTable)
+      .where(
+        eq(atmsTable.portalSource, portal.name as any),
+      );
+
+    const eligibleAtms = atms.filter(a => isNotNull(a.portalAtmId) && a.portalAtmId != null);
+    const terminalIds = eligibleAtms.map(a => a.portalAtmId!);
+
+    if (terminalIds.length === 0) {
+      message = "No terminals with portal IDs found";
+      success = true;
+    } else {
+      const txMap = await scrapeColumbusTransactions(
+        portal.username,
+        portal.passwordEncrypted,
+        terminalIds,
+      );
+
+      for (const [termId, records] of txMap) {
+        if (records.length === 0) continue;
+
+        const atm = eligibleAtms.find(a => a.portalAtmId === termId);
+        if (!atm) continue;
+
+        for (const tx of records) {
+          const ts = new Date(tx.transactedAt);
+          if (isNaN(ts.getTime())) continue;
+
+          await db
+            .insert(atmTransactionLogTable)
+            .values({
+              atmId: atm.id,
+              transactedAt: ts,
+              cardNumber: tx.cardNumber,
+              transactionType: tx.transactionType,
+              amount: tx.amountDispensed ?? 0,
+              response: tx.response,
+              terminalBalance: null,
+              amountRequested: tx.amountRequested,
+              feeRequested: tx.feeRequested,
+              amountDispensed: tx.amountDispensed,
+              feeAmount: tx.feeAmount,
+              termSeq: tx.termSeq,
+            } as any)
+            .onConflictDoNothing();
+        }
+
+        atmsUpdated++;
+      }
+
+      success = true;
+      message = `Transaction sync complete: ${atmsUpdated} terminals updated`;
+    }
+  } catch (err) {
+    message = `Transaction sync failed: ${err instanceof Error ? err.message : String(err)}`;
+    success = false;
+  }
+
+  const durationSeconds = Math.round((Date.now() - startedAt) / 1000);
+
+  await db.insert(portalSyncHistoryTable).values({
+    portalId: portal.id,
+    success,
+    message,
+    atmsUpdated,
     durationSeconds,
   });
 }
@@ -341,7 +443,8 @@ async function performColumbusDataSync(portal: {
             status: resolveStatus(ts, 2000),
             lastSynced: new Date(),
             ...(ts.makeModel ? { makeModel: ts.makeModel } : {}),
-            ...(ts.surcharge != null ? { surcharge: ts.surcharge } : {}),
+            ...(ts.postalCode ? { postalCode: ts.postalCode } : {}),
+            ...(ts.propertyType ? { propertyType: ts.propertyType } : {}),
           } as any)
           .returning();
 
@@ -350,9 +453,6 @@ async function performColumbusDataSync(portal: {
           alertsCreated++;
         }
 
-        if (newAtm) {
-          await storeTransactions(newAtm.id, ts.transactions);
-        }
         atmsUpdated++;
         continue;
       }
@@ -366,15 +466,14 @@ async function performColumbusDataSync(portal: {
         currentBalance: newBalance,
         status: newStatus,
         lastSynced: new Date(),
-        ...(ts.dailyCashDispensed != null ? { avgDailyDispensed: ts.dailyCashDispensed } : {}),
-        ...(ts.dailyTransactionCount != null ? { avgDailyTransactions: ts.dailyTransactionCount } : {}),
-        ...(ts.surcharge != null ? { surcharge: ts.surcharge } : {}),
         ...(ts.makeModel ? { makeModel: ts.makeModel } : {}),
         // Patch address/name only if the report gave us real data
         ...(ts.locationName ? { locationName: ts.locationName } : {}),
         ...(ts.address ? { address: ts.address } : {}),
         ...(ts.city ? { city: ts.city } : {}),
         ...(ts.state ? { state: ts.state } : {}),
+        ...(ts.postalCode ? { postalCode: ts.postalCode } : {}),
+        ...(ts.propertyType ? { propertyType: ts.propertyType } : {}),
       };
 
       await db
@@ -387,7 +486,6 @@ async function performColumbusDataSync(portal: {
         alertsCreated++;
       }
 
-      await storeTransactions(atm.id, ts.transactions);
       atmsUpdated++;
     }
 
@@ -441,44 +539,6 @@ async function createBalanceAlert(
       : `${atmName} cash balance is below threshold ($${balance.toFixed(0)})`,
     resolved: false,
   });
-}
-
-/**
- * Store individual transactions scraped from Table5.
- * Skips any transaction whose timestamp already exists for this ATM
- * to avoid duplicates on repeated syncs.
- */
-async function storeTransactions(
-  atmId: number,
-  transactions: Array<{
-    transactedAt: string;
-    cardNumber: string | null;
-    transactionType: string | null;
-    amount: number | null;
-    response: string | null;
-    terminalBalance: number | null;
-  }>,
-): Promise<void> {
-  if (!transactions.length) return;
-
-  for (const tx of transactions) {
-    const ts = new Date(tx.transactedAt);
-    if (isNaN(ts.getTime())) continue; // skip unparseable timestamps
-
-    // Insert; ignore duplicates via on-conflict do nothing
-    await db
-      .insert(atmTransactionLogTable)
-      .values({
-        atmId,
-        transactedAt: ts,
-        cardNumber: tx.cardNumber,
-        transactionType: tx.transactionType,
-        amount: tx.amount ?? 0,
-        response: tx.response,
-        terminalBalance: tx.terminalBalance,
-      })
-      .onConflictDoNothing();
-  }
 }
 
 /** Simulated sync for portals where we don't yet have a real scraper */

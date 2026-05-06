@@ -33,12 +33,23 @@ export const atmTransactionLogTable = pgTable(
     response: text("response"),
     /** ATM cash balance after this transaction */
     terminalBalance: real("terminal_balance"),
+    /** Amount the customer requested */
+    amountRequested: real("amount_requested"),
+    /** Fee the customer was requested to pay */
+    feeRequested: real("fee_requested"),
+    /** Amount actually dispensed */
+    amountDispensed: real("amount_dispensed"),
+    /** Fee actually charged */
+    feeAmount: real("fee_amount"),
+    /** Terminal sequence number */
+    termSeq: text("term_seq"),
     createdAt: timestamp("created_at").notNull().defaultNow(),
   },
   (t) => ({
-    atmTransactedAtUniq: uniqueIndex("atm_transaction_log_atm_transacted_at_uniq").on(
+    atmTransactedAtUniq: uniqueIndex("atm_transaction_log_uniq").on(
       t.atmId,
       t.transactedAt,
+      t.termSeq,
     ),
   }),
 );

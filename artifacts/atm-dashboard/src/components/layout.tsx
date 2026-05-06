@@ -1,20 +1,22 @@
 import { Link, useLocation } from "wouter";
-import { 
-  LayoutDashboard, 
-  MapPin, 
-  Banknote, 
-  Route as RouteIcon, 
-  AlertCircle, 
-  ServerCog, 
-  BookOpen, 
-  Car, 
-  Users 
+import {
+  LayoutDashboard,
+  MapPin,
+  Banknote,
+  Route as RouteIcon,
+  AlertCircle,
+  ServerCog,
+  BookOpen,
+  Car,
+  Users,
+  Receipt,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const navItems = [
   { href: "/", label: "Dashboard", icon: LayoutDashboard },
   { href: "/atms", label: "ATM Fleet", icon: MapPin },
+  { href: "/transactions", label: "Transactions", icon: Receipt },
   { href: "/cash-planning", label: "Cash Planning", icon: Banknote },
   { href: "/routes", label: "Routes", icon: RouteIcon },
   { href: "/alerts", label: "Alerts", icon: AlertCircle },

@@ -7,7 +7,7 @@ import {
   alertsTable,
   fillOrdersTable,
 } from "@workspace/db";
-import { eq, desc, gte, and } from "drizzle-orm";
+import { eq, desc, gte, and, isNotNull } from "drizzle-orm";
 import {
   ListAtmsQueryParams,
   CreateAtmBody,
@@ -167,6 +167,46 @@ router.get("/atms/:id/transaction-log", async (req, res) => {
     .limit(limit);
 
   res.json(logs);
+});
+
+// ---------------------------------------------------------------------------
+// Global transaction log endpoint (all ATMs)
+// GET /atms/transactions?limit=500&terminalId=L658443
+// ---------------------------------------------------------------------------
+
+router.get("/atms/transactions", async (req, res) => {
+  const limit = Math.min(Number(req.query.limit ?? 500), 1000);
+  const terminalIdFilter = req.query.terminalId as string | undefined;
+
+  const conditions = [isNotNull(atmTransactionLogTable.transactedAt)];
+  if (terminalIdFilter) {
+    conditions.push(eq(atmsTable.portalAtmId, terminalIdFilter));
+  }
+
+  const rows = await db
+    .select({
+      id: atmTransactionLogTable.id,
+      atmId: atmTransactionLogTable.atmId,
+      terminalId: atmsTable.portalAtmId,
+      transactedAt: atmTransactionLogTable.transactedAt,
+      transactionType: atmTransactionLogTable.transactionType,
+      cardNumber: atmTransactionLogTable.cardNumber,
+      amount: atmTransactionLogTable.amount,
+      response: atmTransactionLogTable.response,
+      terminalBalance: atmTransactionLogTable.terminalBalance,
+      amountRequested: (atmTransactionLogTable as any).amountRequested,
+      feeRequested: (atmTransactionLogTable as any).feeRequested,
+      amountDispensed: (atmTransactionLogTable as any).amountDispensed,
+      feeAmount: (atmTransactionLogTable as any).feeAmount,
+      termSeq: (atmTransactionLogTable as any).termSeq,
+    })
+    .from(atmTransactionLogTable)
+    .leftJoin(atmsTable, eq(atmTransactionLogTable.atmId, atmsTable.id))
+    .where(and(...conditions))
+    .orderBy(desc(atmTransactionLogTable.transactedAt))
+    .limit(limit);
+
+  res.json(rows);
 });
 
 // ---------------------------------------------------------------------------
