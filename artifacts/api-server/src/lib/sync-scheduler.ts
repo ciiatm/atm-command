@@ -6,7 +6,7 @@
  */
 
 import { db } from "@workspace/db";
-import { portalsTable, portalSyncHistoryTable, atmsTable, alertsTable } from "@workspace/db";
+import { portalsTable, portalSyncHistoryTable, atmsTable, alertsTable, atmTransactionLogTable } from "@workspace/db";
 import { eq } from "drizzle-orm";
 import { logger } from "./logger.js";
 import { scrapeColumbusData } from "./scrapers/columbus-data.js";
@@ -51,6 +51,8 @@ async function syncPortal(portal: {
         else if (newBalance < (atm?.lowCashThreshold ?? 2000)) newStatus = "low_cash";
         else newStatus = "online";
 
+        let atmId: number | null = atm?.id ?? null;
+
         if (atm) {
           await db
             .update(atmsTable)
@@ -64,7 +66,7 @@ async function syncPortal(portal: {
             .where(eq(atmsTable.id, atm.id));
         } else {
           // Auto-create
-          await db.insert(atmsTable).values({
+          const [created] = await db.insert(atmsTable).values({
             name: ts.terminalLabel || ts.terminalId,
             locationName: ts.terminalLabel || ts.terminalId,
             address: "Unknown",
@@ -75,7 +77,8 @@ async function syncPortal(portal: {
             currentBalance: newBalance,
             status: newStatus,
             lastSynced: new Date(),
-          });
+          }).returning();
+          atmId = created?.id ?? null;
         }
 
         if (newStatus === "low_cash" || newStatus === "error") {
@@ -91,6 +94,26 @@ async function syncPortal(portal: {
             resolved: false,
           });
           alertsCreated++;
+        }
+
+        // Store individual transactions from Table5
+        if (atmId && ts.transactions.length > 0) {
+          for (const tx of ts.transactions) {
+            const txTs = new Date(tx.transactedAt);
+            if (isNaN(txTs.getTime())) continue;
+            await db
+              .insert(atmTransactionLogTable)
+              .values({
+                atmId,
+                transactedAt: txTs,
+                cardNumber: tx.cardNumber,
+                transactionType: tx.transactionType,
+                amount: tx.amount ?? 0,
+                response: tx.response,
+                terminalBalance: tx.terminalBalance,
+              })
+              .onConflictDoNothing();
+          }
         }
 
         atmsUpdated++;

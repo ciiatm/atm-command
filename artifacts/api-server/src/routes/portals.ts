@@ -5,6 +5,7 @@ import {
   portalSyncHistoryTable,
   atmsTable,
   alertsTable,
+  atmTransactionLogTable,
 } from "@workspace/db";
 import { eq, count, desc } from "drizzle-orm";
 import {
@@ -303,7 +304,7 @@ async function performColumbusDataSync(portal: {
 
     for (const ts of terminalStatuses) {
       // Find the ATM by portalAtmId
-      const [atm] = await db
+      let [atm] = await db
         .select()
         .from(atmsTable)
         .where(eq(atmsTable.portalAtmId, ts.terminalId));
@@ -330,6 +331,10 @@ async function performColumbusDataSync(portal: {
           await createBalanceAlert(newAtm.id, newAtm.name, ts.currentBalance ?? 0, newAtm.lowCashThreshold ?? 2000);
           alertsCreated++;
         }
+
+        if (newAtm) {
+          await storeTransactions(newAtm.id, ts.transactions);
+        }
         atmsUpdated++;
         continue;
       }
@@ -343,7 +348,6 @@ async function performColumbusDataSync(portal: {
           currentBalance: newBalance,
           status: newStatus,
           lastSynced: new Date(),
-          // Update avgDailyDispensed from today's data if available
           ...(ts.dailyCashDispensed != null
             ? { avgDailyDispensed: ts.dailyCashDispensed }
             : {}),
@@ -358,6 +362,7 @@ async function performColumbusDataSync(portal: {
         alertsCreated++;
       }
 
+      await storeTransactions(atm.id, ts.transactions);
       atmsUpdated++;
     }
 
@@ -404,6 +409,44 @@ async function createBalanceAlert(
       : `${atmName} cash balance is below threshold ($${balance.toFixed(0)})`,
     resolved: false,
   });
+}
+
+/**
+ * Store individual transactions scraped from Table5.
+ * Skips any transaction whose timestamp already exists for this ATM
+ * to avoid duplicates on repeated syncs.
+ */
+async function storeTransactions(
+  atmId: number,
+  transactions: Array<{
+    transactedAt: string;
+    cardNumber: string | null;
+    transactionType: string | null;
+    amount: number | null;
+    response: string | null;
+    terminalBalance: number | null;
+  }>,
+): Promise<void> {
+  if (!transactions.length) return;
+
+  for (const tx of transactions) {
+    const ts = new Date(tx.transactedAt);
+    if (isNaN(ts.getTime())) continue; // skip unparseable timestamps
+
+    // Insert; ignore duplicates via on-conflict do nothing
+    await db
+      .insert(atmTransactionLogTable)
+      .values({
+        atmId,
+        transactedAt: ts,
+        cardNumber: tx.cardNumber,
+        transactionType: tx.transactionType,
+        amount: tx.amount ?? 0,
+        response: tx.response,
+        terminalBalance: tx.terminalBalance,
+      })
+      .onConflictDoNothing();
+  }
 }
 
 /** Simulated sync for portals where we don't yet have a real scraper */

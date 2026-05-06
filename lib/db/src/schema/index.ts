@@ -7,3 +7,4 @@ export * from "./bookkeeping";
 export * from "./mileage";
 export * from "./payroll";
 export * from "./atm_transactions";
+export * from "./atm_transaction_log";

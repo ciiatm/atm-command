@@ -46,6 +46,14 @@ git pull origin main
 echo "==> [3/5] Rebuilding..."
 ./build.sh
 
+echo "==> [3b] Running DB migrations..."
+# Push any new schema changes (new tables, columns) to the database
+source "$APP_DIR/.env" 2>/dev/null || true
+export DATABASE_URL NODE_ENV
+cd "$APP_DIR/lib/db"
+NODE_ENV=production npx drizzle-kit push --force 2>&1 || echo "  (drizzle push failed, continuing)"
+cd "$APP_DIR"
+
 echo "==> [4/5] Restarting service..."
 sudo systemctl restart atm-command
 

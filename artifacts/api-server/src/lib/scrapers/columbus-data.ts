@@ -16,6 +16,21 @@ const LOGIN_URL =
 const STATUS_URL =
   "https://www.columbusdata.net/cdswebtool/TerminalStatus/CurrentTerminalStatus.aspx";
 
+export interface ColumbusTransaction {
+  /** Timestamp string from the portal, e.g. "May 5 2026  9:03AM" */
+  transactedAt: string;
+  /** Masked card number */
+  cardNumber: string | null;
+  /** Transaction type, e.g. "Withdrawal" */
+  transactionType: string | null;
+  /** Amount dispensed in dollars */
+  amount: number | null;
+  /** Portal response, e.g. "Approved" */
+  response: string | null;
+  /** ATM cash balance after this transaction */
+  terminalBalance: number | null;
+}
+
 export interface ColumbusTerminalStatus {
   /** Raw terminal ID from the portal, e.g. "L443083" */
   terminalId: string;
@@ -35,17 +50,8 @@ export interface ColumbusTerminalStatus {
   dailyTransactionCount: number | null;
   /** Is the ATM reachable/online based on last contact recency */
   isOnline: boolean;
-}
-
-/**
- * Parses a dollar string like "$6,700.00" or "6700" → number
- * Returns null if unparseable.
- */
-function parseDollar(raw: string | null | undefined): number | null {
-  if (!raw) return null;
-  const cleaned = raw.replace(/[$,\s ]/g, "").trim();
-  const n = parseFloat(cleaned);
-  return isNaN(n) ? null : n;
+  /** Individual transactions from Table5 (today's activity) */
+  transactions: ColumbusTransaction[];
 }
 
 /**
@@ -180,6 +186,7 @@ export async function scrapeColumbusData(
           dailyCashDispensed: null,
           dailyTransactionCount: null,
           isOnline: false,
+          transactions: [],
         });
       }
     }
@@ -307,7 +314,6 @@ async function selectTerminal(
 
 /**
  * Wait for any pending Telerik RadAjax request to finish.
- * Polls for the Telerik Sys.Application.get_isRequestInProgress() flag.
  */
 async function waitForAjaxComplete(page: Page, timeoutMs = 15_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -318,7 +324,6 @@ async function waitForAjaxComplete(page: Page, timeoutMs = 15_000): Promise<void
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const ajax = (window as any).Telerik?.Web?.UI?.RadAjaxManager;
           if (ajax) return false; // Can't easily check — just continue
-          // Alternative: check for spinning indicators
           const spinner = document.querySelector(".loading, .spinner, .ajaxLoading");
           return spinner !== null;
         } catch {
@@ -335,7 +340,7 @@ async function waitForAjaxComplete(page: Page, timeoutMs = 15_000): Promise<void
 }
 
 /**
- * Scrape the terminal status from the current page state.
+ * Scrape the terminal status and individual transactions from the current page state.
  */
 async function scrapeTerminalStatus(
   page: Page,
@@ -344,34 +349,41 @@ async function scrapeTerminalStatus(
 ): Promise<ColumbusTerminalStatus> {
   return await page.evaluate(
     (termId, termLabel) => {
-      function text(selector: string): string | null {
+      function cellText(cell: Element): string {
+        return (cell.textContent || "").replace(/ /g, " ").trim();
+      }
+
+      function queryText(selector: string): string | null {
         const el = document.querySelector(selector);
-        return el ? (el.textContent || "").replace(/ /g, " ").trim() : null;
+        return el ? cellText(el) : null;
       }
 
       function parseDollar(raw: string | null): number | null {
         if (!raw) return null;
-        const cleaned = raw.replace(/[$,\s ]/g, "");
+        const cleaned = raw.replace(/[$,\s]/g, "");
         const n = parseFloat(cleaned);
         return isNaN(n) ? null : n;
       }
 
+      // ------------------------------------------------------------------
       // Current balance: <td id="curbalid" class="tmdata">$6,700.00</td>
-      const balanceRaw = text("#curbalid");
-      const currentBalance = parseDollar(balanceRaw);
+      // ------------------------------------------------------------------
+      const currentBalance = parseDollar(queryText("#curbalid"));
 
+      // ------------------------------------------------------------------
       // Surcharge: "Current Surcharge: $3.50"
-      const surchargeRaw = text("#litCurrentSurchargePanel");
+      // ------------------------------------------------------------------
+      const surchargeRaw = queryText("#litCurrentSurchargePanel");
       let surcharge: number | null = null;
       if (surchargeRaw) {
         const m = surchargeRaw.match(/\$([\d,.]+)/);
         surcharge = m ? parseFloat(m[1].replace(",", "")) : null;
       }
 
-      // Table3 contains machine info and last contact
-      // Row structure (based on provided HTML):
-      // Row 0: headers
-      // Row 1: data (make/model, serial?, balance, surcharge, last contact, ...)
+      // ------------------------------------------------------------------
+      // Table3: machine info row
+      // Columns: Make/Model | Serial | Balance | Surcharge | Last Contact | ...
+      // ------------------------------------------------------------------
       let makeModel: string | null = null;
       let lastContact: string | null = null;
 
@@ -380,47 +392,83 @@ async function scrapeTerminalStatus(
         const rows = table3.querySelectorAll("tr");
         if (rows.length >= 2) {
           const cells = rows[1].querySelectorAll("td");
-          if (cells.length >= 1) {
-            makeModel = (cells[0].textContent || "").replace(/ /g, " ").trim() || null;
-          }
-          // Last contact is in cell index 4 (0-based)
-          if (cells.length >= 5) {
-            lastContact = (cells[4].textContent || "").replace(/ /g, " ").trim() || null;
-          }
+          if (cells[0]) makeModel = cellText(cells[0]) || null;
+          // Last contact is the 5th cell (index 4)
+          if (cells[4]) lastContact = cellText(cells[4]) || null;
         }
       }
 
-      // Table4: daily totals
-      // Headers: Cash Disp | Total Trans | App W/D
-      // Data row follows
+      // ------------------------------------------------------------------
+      // Table4: daily totals row
+      // Columns: Cash Disp | Total Trans | App W/D
+      // ------------------------------------------------------------------
       let dailyCashDispensed: number | null = null;
       let dailyTransactionCount: number | null = null;
 
       const table4 = document.querySelector("#Table4");
       if (table4) {
         const rows = table4.querySelectorAll("tr");
-        // Find the data row (not the header row)
         for (let i = 1; i < rows.length; i++) {
           const cells = rows[i].querySelectorAll("td");
           if (cells.length >= 2) {
-            dailyCashDispensed = parseDollar(
-              (cells[0].textContent || "").replace(/ /g, " ").trim(),
-            );
-            const txRaw = (cells[1].textContent || "").replace(/ /g, " ").trim();
-            dailyTransactionCount = parseInt(txRaw, 10) || null;
+            dailyCashDispensed = parseDollar(cellText(cells[0]));
+            dailyTransactionCount = parseInt(cellText(cells[1]), 10) || null;
             break;
           }
         }
       }
 
-      // Determine online status based on last contact recency
+      // ------------------------------------------------------------------
+      // Table5: individual transactions
+      // Columns: Date/Time | Card # | Type | Amount | Response | Terminal Bal
+      // Data rows have td.tmDataGrid cells
+      // ------------------------------------------------------------------
+      const transactions: {
+        transactedAt: string;
+        cardNumber: string | null;
+        transactionType: string | null;
+        amount: number | null;
+        response: string | null;
+        terminalBalance: number | null;
+      }[] = [];
+
+      const table5 = document.querySelector("#Table5");
+      if (table5) {
+        const rows = table5.querySelectorAll("tr");
+        for (let i = 0; i < rows.length; i++) {
+          // Transaction data rows have td.tmDataGrid cells
+          const cells = rows[i].querySelectorAll("td.tmDataGrid");
+          if (cells.length >= 5) {
+            const transactedAt = cellText(cells[0]);
+            const cardNumber = cellText(cells[1]) || null;
+            const transactionType = cellText(cells[2]) || null;
+            const amount = parseDollar(cellText(cells[3]));
+            const response = cellText(cells[4]) || null;
+            // Terminal balance is the 6th column (index 5) if present
+            const terminalBalance = cells[5] ? parseDollar(cellText(cells[5])) : null;
+
+            if (transactedAt) {
+              transactions.push({
+                transactedAt,
+                cardNumber,
+                transactionType,
+                amount,
+                response,
+                terminalBalance,
+              });
+            }
+          }
+        }
+      }
+
+      // ------------------------------------------------------------------
+      // Online status: last contact within 24 hours
+      // ------------------------------------------------------------------
       let isOnline = false;
       if (lastContact) {
         const contactDate = new Date(lastContact);
         if (!isNaN(contactDate.getTime())) {
-          const ageMs = Date.now() - contactDate.getTime();
-          // If last contact was within 24 hours, consider online
-          isOnline = ageMs < 24 * 60 * 60 * 1000;
+          isOnline = Date.now() - contactDate.getTime() < 24 * 60 * 60 * 1000;
         }
       }
 
@@ -434,6 +482,7 @@ async function scrapeTerminalStatus(
         dailyCashDispensed,
         dailyTransactionCount,
         isOnline,
+        transactions,
       };
     },
     termId,
