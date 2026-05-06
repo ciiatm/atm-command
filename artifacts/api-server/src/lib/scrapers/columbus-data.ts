@@ -171,8 +171,10 @@ export async function scrapeColumbusData(
     await page.type(passSelector, password, { delay: 30 });
 
     // Click login and wait for navigation
+    // Use "domcontentloaded" — Telerik keeps persistent XHR open so
+    // "networkidle2" never settles.
     await Promise.all([
-      page.waitForNavigation({ waitUntil: "networkidle2" }),
+      page.waitForNavigation({ waitUntil: "domcontentloaded" }),
       page.click(submitSelector),
     ]);
 
@@ -193,7 +195,11 @@ export async function scrapeColumbusData(
     // -----------------------------------------------------------------------
     if (!currentUrl.includes("CurrentTerminalStatus")) {
       logger.info("Columbus Data: navigating to terminal status page");
-      await page.goto(STATUS_URL, { waitUntil: "networkidle2" });
+      // Use "domcontentloaded" — Telerik RadAjaxManager keeps persistent
+      // background connections open so "networkidle2" never fires.
+      await page.goto(STATUS_URL, { waitUntil: "domcontentloaded" });
+      // Give JS a moment to render the Telerik controls
+      await page.waitForTimeout(3_000);
     }
 
     const statusUrl = page.url();
