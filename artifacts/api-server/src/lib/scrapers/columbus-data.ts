@@ -334,19 +334,31 @@ interface TerminalRef {
 
 /**
  * Extract all terminal IDs from the Telerik RadComboBox dropdown.
- * The dropdown list items are rendered as <li> elements inside
- * #cbsTerminals_radTerminalSelector_DropDown.
+ * The <li> items are only rendered after the dropdown is opened, so we
+ * click the arrow first, wait for items to load, then read them.
  */
 async function extractTerminalList(page: Page): Promise<TerminalRef[]> {
-  // Primary method: read <li> items from the Telerik dropdown list
+  // Click the dropdown arrow to open it and trigger option loading
+  const arrow = await page.$("#cbsTerminals_radTerminalSelector_Arrow");
+  if (arrow) {
+    await arrow.click();
+    // Wait for at least one <li> to appear inside the dropdown (up to 10s)
+    await page
+      .waitForSelector("#cbsTerminals_radTerminalSelector_DropDown li", { timeout: 10_000 })
+      .catch(() => {});
+    await page.waitForTimeout(1_000); // let remaining options render
+  }
+
+  // Read all <li> items — Telerik renders them with or without [id]
   const fromLi = await page.evaluate(() => {
     const items = document.querySelectorAll(
-      "#cbsTerminals_radTerminalSelector_DropDown li[id]",
+      "#cbsTerminals_radTerminalSelector_DropDown li",
     );
     const result: { id: string; label: string }[] = [];
     items.forEach((li) => {
       const text = (li.textContent || "").trim();
-      // The value is the terminal ID — it's the first token before " - "
+      if (!text) return;
+      // Terminal ID is the first whitespace-delimited token (e.g. "L443083")
       const match = text.match(/^(\S+)/);
       const id = match ? match[1] : text;
       if (id) result.push({ id, label: text });
@@ -354,9 +366,10 @@ async function extractTerminalList(page: Page): Promise<TerminalRef[]> {
     return result;
   });
 
+  logger.info({ count: fromLi.length, sample: fromLi.slice(0, 3) }, "Columbus Data: dropdown list items");
   if (fromLi.length > 0) return fromLi;
 
-  // Fallback: parse the hidden ClientState JSON
+  // Fallback: parse the hidden ClientState JSON (gives only the currently selected terminal)
   const fromClientState = await page.evaluate(() => {
     const inputs = Array.from(
       document.querySelectorAll("input[type=hidden]"),
@@ -365,8 +378,6 @@ async function extractTerminalList(page: Page): Promise<TerminalRef[]> {
       if (input.id?.includes("radTerminalSelector_ClientState")) {
         try {
           const parsed = JSON.parse(input.value);
-          // ClientState is for the SELECTED item; we need the full list.
-          // Return whatever terminal is current so we at least get one.
           if (parsed?.value && parsed?.text) {
             return [{ id: parsed.value as string, label: parsed.text as string }];
           }
