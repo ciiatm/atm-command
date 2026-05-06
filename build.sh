@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 export CI=true
+# Tell Puppeteer to use system Chromium instead of downloading its own ~300 MB Chrome binary.
+# CHROMIUM_PATH is set by remote-deploy.sh; on dev machines this is a no-op.
+export PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 
 echo "==> Installing dependencies..."
 pnpm install --no-frozen-lockfile

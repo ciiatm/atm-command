@@ -3,18 +3,18 @@
  *
  * Checks every hour whether any active portal is overdue for a sync
  * (based on its syncIntervalHours setting) and triggers it automatically.
- * The sync logic lives in routes/portals.ts; we import only what we need.
  */
 
 import { db } from "@workspace/db";
 import { portalsTable, portalSyncHistoryTable, atmsTable, alertsTable } from "@workspace/db";
 import { eq } from "drizzle-orm";
-import { logger } from "./logger";
+import { logger } from "./logger.js";
+import { scrapeColumbusData } from "./scrapers/columbus-data.js";
 
 const CHECK_INTERVAL_MS = 60 * 60 * 1000; // check every hour
 
 // ---------------------------------------------------------------------------
-// Sync logic (mirrors performPortalSync in routes/portals.ts)
+// Sync logic
 // ---------------------------------------------------------------------------
 
 async function syncPortal(portal: {
@@ -31,46 +31,116 @@ async function syncPortal(portal: {
   let alertsCreated = 0;
 
   try {
-    const atms = await db
-      .select()
-      .from(atmsTable)
-      .where(eq(atmsTable.portalSource, portal.name as any));
+    if (portal.name === "columbus_data") {
+      // Real scraper
+      const terminalStatuses = await scrapeColumbusData(
+        portal.username,
+        portal.passwordEncrypted,
+      );
 
-    for (const atm of atms) {
-      const dailyDispensed = atm.avgDailyDispensed ?? 500;
-      const daysSinceSync = atm.lastSynced
-        ? Math.max(1, Math.floor((Date.now() - new Date(atm.lastSynced).getTime()) / 86_400_000))
-        : 1;
-      const dispensed = dailyDispensed * daysSinceSync * (0.8 + Math.random() * 0.4);
-      const newBalance = Math.max(0, (atm.currentBalance ?? 5000) - dispensed);
+      for (const ts of terminalStatuses) {
+        const [atm] = await db
+          .select()
+          .from(atmsTable)
+          .where(eq(atmsTable.portalAtmId, ts.terminalId));
 
-      let newStatus: "online" | "offline" | "error" | "low_cash" | "unknown" = "online";
-      if (newBalance === 0) newStatus = "error";
-      else if (newBalance < (atm.lowCashThreshold ?? 2000)) newStatus = "low_cash";
+        const newBalance = ts.currentBalance ?? (atm?.currentBalance ?? 0);
+        let newStatus: "online" | "offline" | "error" | "low_cash" | "unknown" = "unknown";
+        if (!ts.isOnline) newStatus = "offline";
+        else if (newBalance === 0) newStatus = "error";
+        else if (newBalance < (atm?.lowCashThreshold ?? 2000)) newStatus = "low_cash";
+        else newStatus = "online";
 
-      await db
-        .update(atmsTable)
-        .set({ currentBalance: newBalance, status: newStatus, lastSynced: new Date() })
-        .where(eq(atmsTable.id, atm.id));
+        if (atm) {
+          await db
+            .update(atmsTable)
+            .set({
+              currentBalance: newBalance,
+              status: newStatus,
+              lastSynced: new Date(),
+              ...(ts.dailyCashDispensed != null ? { avgDailyDispensed: ts.dailyCashDispensed } : {}),
+              ...(ts.dailyTransactionCount != null ? { avgDailyTransactions: ts.dailyTransactionCount } : {}),
+            })
+            .where(eq(atmsTable.id, atm.id));
+        } else {
+          // Auto-create
+          await db.insert(atmsTable).values({
+            name: ts.terminalLabel || ts.terminalId,
+            locationName: ts.terminalLabel || ts.terminalId,
+            address: "Unknown",
+            city: "Unknown",
+            state: "Unknown",
+            portalSource: "columbus_data",
+            portalAtmId: ts.terminalId,
+            currentBalance: newBalance,
+            status: newStatus,
+            lastSynced: new Date(),
+          });
+        }
 
-      if (newStatus === "low_cash" || newStatus === "error") {
-        await db.insert(alertsTable).values({
-          atmId: atm.id,
-          type: newStatus === "error" ? "out_of_cash" : "low_cash",
-          severity: newStatus === "error" ? "critical" : "warning",
-          message:
-            newStatus === "error"
-              ? `${atm.name} is out of cash`
-              : `${atm.name} cash balance is low ($${newBalance.toFixed(0)})`,
-          resolved: false,
-        });
-        alertsCreated++;
+        if (newStatus === "low_cash" || newStatus === "error") {
+          const atmName = atm?.name ?? ts.terminalLabel;
+          await db.insert(alertsTable).values({
+            atmId: atm?.id ?? 0,
+            type: newStatus === "error" ? "out_of_cash" : "low_cash",
+            severity: newStatus === "error" ? "critical" : "warning",
+            message:
+              newStatus === "error"
+                ? `${atmName} is out of cash`
+                : `${atmName} cash balance is low ($${newBalance.toFixed(0)})`,
+            resolved: false,
+          });
+          alertsCreated++;
+        }
+
+        atmsUpdated++;
       }
-    }
 
-    success = true;
-    atmsUpdated = atms.length;
-    message = `Auto-synced ${atms.length} ATMs`;
+      success = true;
+      message = `Auto-synced ${atmsUpdated} ATMs from Columbus Data`;
+    } else {
+      // Simulated sync for other portals
+      const atms = await db
+        .select()
+        .from(atmsTable)
+        .where(eq(atmsTable.portalSource, portal.name as any));
+
+      for (const atm of atms) {
+        const dailyDispensed = atm.avgDailyDispensed ?? 500;
+        const daysSinceSync = atm.lastSynced
+          ? Math.max(1, Math.floor((Date.now() - new Date(atm.lastSynced).getTime()) / 86_400_000))
+          : 1;
+        const dispensed = dailyDispensed * daysSinceSync * (0.8 + Math.random() * 0.4);
+        const newBalance = Math.max(0, (atm.currentBalance ?? 5000) - dispensed);
+
+        let newStatus: "online" | "offline" | "error" | "low_cash" | "unknown" = "online";
+        if (newBalance === 0) newStatus = "error";
+        else if (newBalance < (atm.lowCashThreshold ?? 2000)) newStatus = "low_cash";
+
+        await db
+          .update(atmsTable)
+          .set({ currentBalance: newBalance, status: newStatus, lastSynced: new Date() })
+          .where(eq(atmsTable.id, atm.id));
+
+        if (newStatus === "low_cash" || newStatus === "error") {
+          await db.insert(alertsTable).values({
+            atmId: atm.id,
+            type: newStatus === "error" ? "out_of_cash" : "low_cash",
+            severity: newStatus === "error" ? "critical" : "warning",
+            message:
+              newStatus === "error"
+                ? `${atm.name} is out of cash`
+                : `${atm.name} cash balance is low ($${newBalance.toFixed(0)})`,
+            resolved: false,
+          });
+          alertsCreated++;
+        }
+      }
+
+      success = true;
+      atmsUpdated = atms.length;
+      message = `Auto-synced ${atms.length} ATMs`;
+    }
   } catch (err) {
     message = `Auto-sync failed: ${err instanceof Error ? err.message : String(err)}`;
     logger.error({ portalId: portal.id, err }, "Auto-sync error");

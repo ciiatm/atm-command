@@ -14,6 +14,7 @@ import {
   DeletePortalParams,
   SyncPortalParams,
 } from "@workspace/api-zod";
+import { scrapeColumbusData } from "../lib/scrapers/columbus-data.js";
 
 const PORTAL_CONFIG: Record<
   string,
@@ -272,8 +273,152 @@ async function performPortalSync(portal: {
   atmsUpdated: number;
   alertsCreated: number;
 }> {
+  // Route to real scraper for Columbus Data; simulate for others
+  if (portal.name === "columbus_data") {
+    return performColumbusDataSync(portal);
+  }
+  return performSimulatedSync(portal);
+}
+
+/** Real Columbus Data sync using Puppeteer */
+async function performColumbusDataSync(portal: {
+  id: number;
+  name: string;
+  username: string;
+  passwordEncrypted: string;
+}): Promise<{
+  success: boolean;
+  message: string;
+  atmsUpdated: number;
+  alertsCreated: number;
+}> {
   try {
-    // Get ATMs linked to this portal
+    const terminalStatuses = await scrapeColumbusData(
+      portal.username,
+      portal.passwordEncrypted,
+    );
+
+    let atmsUpdated = 0;
+    let alertsCreated = 0;
+
+    for (const ts of terminalStatuses) {
+      // Find the ATM by portalAtmId
+      const [atm] = await db
+        .select()
+        .from(atmsTable)
+        .where(eq(atmsTable.portalAtmId, ts.terminalId));
+
+      if (!atm) {
+        // Auto-create the ATM if it doesn't exist yet
+        const [newAtm] = await db
+          .insert(atmsTable)
+          .values({
+            name: ts.terminalLabel || ts.terminalId,
+            locationName: ts.terminalLabel || ts.terminalId,
+            address: "Unknown",
+            city: "Unknown",
+            state: "Unknown",
+            portalSource: "columbus_data",
+            portalAtmId: ts.terminalId,
+            currentBalance: ts.currentBalance ?? 0,
+            status: resolveStatus(ts),
+            lastSynced: new Date(),
+          })
+          .returning();
+
+        if (newAtm && (ts.currentBalance ?? 0) < (newAtm.lowCashThreshold ?? 2000)) {
+          await createBalanceAlert(newAtm.id, newAtm.name, ts.currentBalance ?? 0, newAtm.lowCashThreshold ?? 2000);
+          alertsCreated++;
+        }
+        atmsUpdated++;
+        continue;
+      }
+
+      const newStatus = resolveStatus(ts);
+      const newBalance = ts.currentBalance ?? atm.currentBalance ?? 0;
+
+      await db
+        .update(atmsTable)
+        .set({
+          currentBalance: newBalance,
+          status: newStatus,
+          lastSynced: new Date(),
+          // Update avgDailyDispensed from today's data if available
+          ...(ts.dailyCashDispensed != null
+            ? { avgDailyDispensed: ts.dailyCashDispensed }
+            : {}),
+          ...(ts.dailyTransactionCount != null
+            ? { avgDailyTransactions: ts.dailyTransactionCount }
+            : {}),
+        })
+        .where(eq(atmsTable.id, atm.id));
+
+      if (newStatus === "low_cash" || newStatus === "error") {
+        await createBalanceAlert(atm.id, atm.name, newBalance, atm.lowCashThreshold ?? 2000);
+        alertsCreated++;
+      }
+
+      atmsUpdated++;
+    }
+
+    return {
+      success: true,
+      message: `Synced ${atmsUpdated} ATMs from Columbus Data`,
+      atmsUpdated,
+      alertsCreated,
+    };
+  } catch (err) {
+    return {
+      success: false,
+      message: `Columbus Data sync failed: ${err instanceof Error ? err.message : "Unknown error"}`,
+      atmsUpdated: 0,
+      alertsCreated: 0,
+    };
+  }
+}
+
+function resolveStatus(ts: {
+  currentBalance: number | null;
+  isOnline: boolean;
+}): "online" | "offline" | "error" | "low_cash" | "unknown" {
+  if (!ts.isOnline) return "offline";
+  if (ts.currentBalance === null) return "unknown";
+  if (ts.currentBalance === 0) return "error";
+  if (ts.currentBalance < 2000) return "low_cash";
+  return "online";
+}
+
+async function createBalanceAlert(
+  atmId: number,
+  atmName: string,
+  balance: number,
+  threshold: number,
+): Promise<void> {
+  const isEmpty = balance === 0;
+  await db.insert(alertsTable).values({
+    atmId,
+    type: isEmpty ? "out_of_cash" : "low_cash",
+    severity: isEmpty ? "critical" : "warning",
+    message: isEmpty
+      ? `${atmName} is out of cash`
+      : `${atmName} cash balance is below threshold ($${balance.toFixed(0)})`,
+    resolved: false,
+  });
+}
+
+/** Simulated sync for portals where we don't yet have a real scraper */
+async function performSimulatedSync(portal: {
+  id: number;
+  name: string;
+  username: string;
+  passwordEncrypted: string;
+}): Promise<{
+  success: boolean;
+  message: string;
+  atmsUpdated: number;
+  alertsCreated: number;
+}> {
+  try {
     const atms = await db
       .select()
       .from(atmsTable)
@@ -281,7 +426,6 @@ async function performPortalSync(portal: {
 
     let alertsCreated = 0;
 
-    // Simulate updating balances with realistic fluctuation
     for (const atm of atms) {
       const dailyDispensed = atm.avgDailyDispensed ?? 500;
       const daysSinceSync = atm.lastSynced
@@ -290,7 +434,8 @@ async function performPortalSync(portal: {
               (1000 * 60 * 60 * 24),
           )
         : 1;
-      const dispensed = dailyDispensed * Math.max(1, daysSinceSync) * (0.8 + Math.random() * 0.4);
+      const dispensed =
+        dailyDispensed * Math.max(1, daysSinceSync) * (0.8 + Math.random() * 0.4);
       const newBalance = Math.max(0, (atm.currentBalance ?? 5000) - dispensed);
 
       let newStatus: "online" | "offline" | "error" | "low_cash" | "unknown" =
@@ -300,26 +445,18 @@ async function performPortalSync(portal: {
 
       await db
         .update(atmsTable)
-        .set({
-          currentBalance: newBalance,
-          status: newStatus,
-          lastSynced: new Date(),
-        })
+        .set({ currentBalance: newBalance, status: newStatus, lastSynced: new Date() })
         .where(eq(atmsTable.id, atm.id));
 
-      // Create alert if needed
       if (newStatus === "low_cash" || newStatus === "error") {
-        const severity = newStatus === "error" ? "critical" : "warning";
-        const type = newStatus === "error" ? "out_of_cash" : "low_cash";
         const message =
           newStatus === "error"
             ? `${atm.name} is out of cash`
             : `${atm.name} cash balance is below threshold ($${newBalance.toFixed(0)})`;
-
         await db.insert(alertsTable).values({
           atmId: atm.id,
-          type,
-          severity,
+          type: newStatus === "error" ? "out_of_cash" : "low_cash",
+          severity: newStatus === "error" ? "critical" : "warning",
           message,
           resolved: false,
         });
