@@ -57,6 +57,17 @@ function BalanceBar({ balance, capacity, status }: { balance: number; capacity: 
   );
 }
 
+/** Returns true when the field contains real data (not the placeholder the scraper inserts) */
+function hasAddress(atm: Atm) {
+  const a = (atm.address ?? "").trim();
+  return a.length > 0 && a.toLowerCase() !== "unknown";
+}
+
+function addressLine(atm: Atm) {
+  if (!hasAddress(atm)) return null;
+  return `${atm.address}, ${atm.city}, ${atm.state}`;
+}
+
 function responseColor(response: string | null) {
   if (!response) return "text-muted-foreground";
   const r = response.toLowerCase();
@@ -75,8 +86,10 @@ function ATMDetailSheet({ atm, open, onClose }: { atm: Atm | null; open: boolean
     <Sheet open={open} onOpenChange={onClose}>
       <SheetContent className="w-full sm:max-w-2xl overflow-y-auto">
         <SheetHeader className="mb-4">
-          <SheetTitle>{atm.name}</SheetTitle>
-          <p className="text-sm text-muted-foreground">{atm.address}, {atm.city}, {atm.state}</p>
+          <SheetTitle>{atm.locationName || atm.name}</SheetTitle>
+          {addressLine(atm) && (
+            <p className="text-sm text-muted-foreground">{addressLine(atm)}</p>
+          )}
         </SheetHeader>
 
         <Tabs defaultValue="overview">
@@ -110,6 +123,9 @@ function ATMDetailSheet({ atm, open, onClose }: { atm: Atm | null; open: boolean
               <div><span className="text-muted-foreground">Low Cash Threshold</span><div className="mt-1 font-medium">${atm.lowCashThreshold.toLocaleString()}</div></div>
               <div><span className="text-muted-foreground">Cash Capacity</span><div className="mt-1 font-medium">${atm.cashCapacity.toLocaleString()}</div></div>
               <div><span className="text-muted-foreground">Last Synced</span><div className="mt-1 font-medium">{atm.lastSynced ? new Date(atm.lastSynced).toLocaleString() : "Never"}</div></div>
+              {addressLine(atm) && (
+                <div className="col-span-2"><span className="text-muted-foreground">Address</span><div className="mt-1 font-medium">{addressLine(atm)}</div></div>
+              )}
             </div>
 
             {/* 14-day chart */}
@@ -132,8 +148,8 @@ function ATMDetailSheet({ atm, open, onClose }: { atm: Atm | null; open: boolean
           <TabsContent value="transactions" className="mt-0">
             {txLog.length === 0 ? (
               <div className="py-12 text-center text-muted-foreground text-sm">
-                No transactions found for this terminal.
-                <p className="text-xs mt-1 opacity-60">Sync the portal to pull transaction data.</p>
+                No transactions recorded yet.
+                <p className="text-xs mt-2 opacity-60 max-w-xs mx-auto">Transaction history is pulled from the portal during each sync. Run a portal sync to populate this data.</p>
               </div>
             ) : (
               <div className="border rounded-lg overflow-hidden">
@@ -777,7 +793,9 @@ export default function ATMFleet() {
                   </p>
                   {statusBadge(atm.status)}
                 </div>
-                <p className="text-xs text-muted-foreground truncate">{atm.address}, {atm.city}, {atm.state}</p>
+                {addressLine(atm) && (
+                  <p className="text-xs text-muted-foreground truncate">{addressLine(atm)}</p>
+                )}
                 <BalanceBar balance={atm.currentBalance} capacity={atm.cashCapacity} status={atm.status} />
               </div>
               <div className="text-right flex-shrink-0 cursor-pointer" onClick={() => setSelected(atm)}>

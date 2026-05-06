@@ -17,4 +17,5 @@ jobs:
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
           script_stop: true
+          command_timeout: 30m
           script: bash /opt/atm-command/scripts/remote-deploy.sh
