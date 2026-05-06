@@ -1,29 +1,54 @@
 /**
  * Columbus Data Portal Scraper
  *
- * Logs in to https://www.columbusdata.net/cdswebtool/login/login.aspx
- * and scrapes ATM status data for every terminal on the account.
+ * Strategy:
+ * 1. Login to the portal
+ * 2. Scrape the "Terminal Status Report" grid — shows ALL terminals with
+ *    balance, last contact, last error on a single page (most reliable)
+ * 3. For each terminal found in the grid, also visit TermIDStatus.aspx
+ *    to pull today's individual transactions from Table5
  *
- * Requires: puppeteer (installed as a dependency)
- * On EC2/Linux: chromium-browser must be installed for --no-sandbox to work.
+ * Requires: puppeteer
+ * On EC2/Linux: google-chrome-stable (non-snap) must be installed.
  */
 
 import puppeteer, { type Browser, type Page } from "puppeteer";
 import { execSync } from "node:child_process";
 import { logger } from "../logger.js";
 
-/**
- * Find the system Chromium/Chrome executable.
- * Checks CHROMIUM_PATH env first, then common binary names via `which`.
- */
+const LOGIN_URL = "https://www.columbusdata.net/cdswebtool/login/login.aspx";
+const REPORT_URL = "https://www.columbusdata.net/cdswebtool/QuickView/TerminalStatusReport.aspx";
+const MONITOR_URL = "https://www.columbusdata.net/cdswebtool/TerminalMonitoring/TermIDStatus.aspx";
+
+export interface ColumbusTransaction {
+  transactedAt: string;
+  cardNumber: string | null;
+  transactionType: string | null;
+  amount: number | null;
+  response: string | null;
+  terminalBalance: number | null;
+}
+
+export interface ColumbusTerminalStatus {
+  terminalId: string;
+  terminalLabel: string;
+  currentBalance: number | null;
+  surcharge: number | null;
+  lastContact: string | null;
+  makeModel: string | null;
+  dailyCashDispensed: number | null;
+  dailyTransactionCount: number | null;
+  isOnline: boolean;
+  transactions: ColumbusTransaction[];
+}
+
+// ---------------------------------------------------------------------------
+// Chromium detection
+// ---------------------------------------------------------------------------
+
 function findChromiumExecutable(): string | undefined {
   if (process.env.CHROMIUM_PATH) return process.env.CHROMIUM_PATH;
-  const candidates = [
-    "chromium-browser",
-    "chromium",
-    "google-chrome",
-    "google-chrome-stable",
-  ];
+  const candidates = ["google-chrome-stable", "google-chrome", "chromium", "chromium-browser"];
   for (const bin of candidates) {
     try {
       const p = execSync(`which ${bin} 2>/dev/null`).toString().trim();
@@ -31,284 +56,332 @@ function findChromiumExecutable(): string | undefined {
         logger.info({ path: p }, "Columbus Data: found system Chromium");
         return p;
       }
-    } catch {
-      // not found, try next
-    }
+    } catch { /* try next */ }
   }
-  return undefined; // let Puppeteer use its bundled chrome if present
+  return undefined;
 }
 
-const LOGIN_URL =
-  "https://www.columbusdata.net/cdswebtool/login/login.aspx";
-const STATUS_URL =
-  "https://www.columbusdata.net/cdswebtool/TerminalMonitoring/TermIDStatus.aspx";
+// ---------------------------------------------------------------------------
+// Main entry point
+// ---------------------------------------------------------------------------
 
-export interface ColumbusTransaction {
-  /** Timestamp string from the portal, e.g. "May 5 2026  9:03AM" */
-  transactedAt: string;
-  /** Masked card number */
-  cardNumber: string | null;
-  /** Transaction type, e.g. "Withdrawal" */
-  transactionType: string | null;
-  /** Amount dispensed in dollars */
-  amount: number | null;
-  /** Portal response, e.g. "Approved" */
-  response: string | null;
-  /** ATM cash balance after this transaction */
-  terminalBalance: number | null;
-}
-
-export interface ColumbusTerminalStatus {
-  /** Raw terminal ID from the portal, e.g. "L443083" */
-  terminalId: string;
-  /** Display name from the dropdown, e.g. "L443083 - SHEPS BAR & GRILL" */
-  terminalLabel: string;
-  /** Current cash balance in dollars (parsed from "$6,700.00") */
-  currentBalance: number | null;
-  /** Surcharge amount in dollars */
-  surcharge: number | null;
-  /** Last contact timestamp string as shown on page */
-  lastContact: string | null;
-  /** Make/model string from Table3 */
-  makeModel: string | null;
-  /** Cash dispensed today in dollars */
-  dailyCashDispensed: number | null;
-  /** Total transactions today */
-  dailyTransactionCount: number | null;
-  /** Is the ATM reachable/online based on last contact recency */
-  isOnline: boolean;
-  /** Individual transactions from Table5 (today's activity) */
-  transactions: ColumbusTransaction[];
-}
-
-/**
- * Scrape all terminals from Columbus Data for the given credentials.
- * Returns an array of terminal status objects.
- */
 export async function scrapeColumbusData(
   username: string,
   password: string,
 ): Promise<ColumbusTerminalStatus[]> {
   let browser: Browser | null = null;
-
   try {
     const executablePath = findChromiumExecutable();
     logger.info({ executablePath: executablePath ?? "puppeteer-bundled" }, "Columbus Data: launching browser");
 
     browser = await puppeteer.launch({
       headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--no-zygote",
-        "--single-process",
-      ],
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--no-zygote", "--single-process"],
       executablePath,
     });
 
     const page = await browser.newPage();
-    await page.setDefaultNavigationTimeout(60_000);
-    await page.setDefaultTimeout(30_000);
+    page.setDefaultNavigationTimeout(60_000);
+    page.setDefaultTimeout(30_000);
 
-    // -----------------------------------------------------------------------
+    // ------------------------------------------------------------------
     // Step 1: Login
-    // -----------------------------------------------------------------------
-    logger.info("Columbus Data: navigating to login page");
-    await page.goto(LOGIN_URL, { waitUntil: "networkidle2" });
+    // ------------------------------------------------------------------
+    logger.info("Columbus Data: logging in");
+    await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded" });
 
-    // Dump all input field IDs/names so we can debug selector issues
-    const inputFields = await page.evaluate(() =>
-      Array.from(document.querySelectorAll("input")).map((el) => ({
-        id: el.id,
-        name: el.name,
-        type: el.type,
-      })),
-    );
-    logger.info({ inputFields }, "Columbus Data: login page inputs");
-
-    // Find username field — Columbus Data uses #UsernameTextbox
-    const userSelector = await findInputSelector(page, [
-      "#UsernameTextbox",
-      "#txtUserName",
-      "#txtUsername",
-      "#UserName",
-      "input[name='UsernameTextbox']",
-      "input[name*='UserName']",
-      "input[name*='userName']",
-      "input[type='text']",
-      "input[type='email']",
-    ]);
-    if (!userSelector) throw new Error("Columbus Data: could not find username field on login page");
-
-    const passSelector = await findInputSelector(page, [
-      "#PasswordTextbox",
-      "#txtPassword",
-      "#Password",
-      "input[name='PasswordTextbox']",
-      "input[name*='Password']",
-      "input[type='password']",
-    ]);
-    if (!passSelector) throw new Error("Columbus Data: could not find password field on login page");
-
-    // Find submit button — Columbus Data uses #LoginButton
-    const submitSelector = await findInputSelector(page, [
-      "#LoginButton",
-      "#btnLogin",
-      "#btnSubmit",
-      "input[name='LoginButton']",
-      "input[type='submit']",
-      "button[type='submit']",
-      "input[value*='Logon']",
-      "input[value*='Login']",
-    ]);
-    if (!submitSelector) throw new Error("Columbus Data: could not find login button");
-
-    logger.info({ userSelector, passSelector, submitSelector }, "Columbus Data: found login fields");
-
-    await page.type(userSelector, username, { delay: 30 });
-    await page.type(passSelector, password, { delay: 30 });
-
-    // Click login and wait for navigation
-    // Use "domcontentloaded" — Telerik keeps persistent XHR open so
-    // "networkidle2" never settles.
+    await page.waitForSelector("#UsernameTextbox", { visible: true });
+    await page.type("#UsernameTextbox", username, { delay: 30 });
+    await page.type("#PasswordTextbox", password, { delay: 30 });
     await Promise.all([
       page.waitForNavigation({ waitUntil: "domcontentloaded" }),
-      page.click(submitSelector),
+      page.click("#LoginButton"),
     ]);
 
-    const currentUrl = page.url();
-    logger.info({ currentUrl }, "Columbus Data: after login");
-
-    // Detect login failure — still on a login-like URL
-    if (/login|Login|signin|SignIn/i.test(currentUrl)) {
-      const errorEl = await page.$(".errormessage, .error, #lblError, .alert, .message");
-      const errorText = errorEl
-        ? await page.evaluate((el) => el.textContent?.trim(), errorEl)
-        : "Still on login page — check credentials";
-      throw new Error(`Columbus Data login failed: ${errorText}`);
+    const afterLoginUrl = page.url();
+    logger.info({ afterLoginUrl }, "Columbus Data: after login");
+    if (/login|Login/i.test(afterLoginUrl)) {
+      throw new Error("Columbus Data login failed — still on login page, check credentials");
     }
 
-    // -----------------------------------------------------------------------
-    // Step 2: Navigate to Terminal Status page (TermIDStatus.aspx)
-    // -----------------------------------------------------------------------
-    if (!currentUrl.includes("TermIDStatus") && !currentUrl.includes("CurrentTerminalStatus")) {
-      logger.info({ url: STATUS_URL }, "Columbus Data: navigating to terminal status page");
-      page.goto(STATUS_URL).catch(() => {}); // fire-and-forget — page never settles to idle
+    // ------------------------------------------------------------------
+    // Step 2: Scrape the Terminal Status Report grid (all terminals at once)
+    // ------------------------------------------------------------------
+    logger.info({ url: REPORT_URL }, "Columbus Data: navigating to status report grid");
+    page.goto(REPORT_URL).catch(() => {});
+
+    // Wait for the Telerik RadGrid table to appear
+    const gridFound = await page
+      .waitForSelector("table[id*='rgTermStatusReport']", { timeout: 45_000 })
+      .then(() => true).catch(() => false);
+
+    logger.info({ gridFound }, "Columbus Data: status report grid loaded");
+    if (!gridFound) {
+      const html = await page.evaluate(() => document.body?.innerHTML?.slice(0, 2000) ?? "");
+      logger.warn({ html }, "Columbus Data: grid not found");
+      throw new Error("Columbus Data: status report grid not found after 45s");
     }
 
-    // -----------------------------------------------------------------------
-    // Step 3: Wait for terminal selector and log page elements
-    // -----------------------------------------------------------------------
-    // Wait up to 45s for any element whose ID contains "radTerminalSelector"
-    logger.info("Columbus Data: waiting for terminal selector...");
-    const terminalSelectorFound = await page
-      .waitForSelector("[id*='radTerminalSelector']", { timeout: 45_000 })
-      .then(() => true)
-      .catch(() => false);
+    // Try to set page size to 100 so we get more terminals per page
+    await setGridPageSize(page, 100);
 
-    const statusUrl = page.url();
-    const statusTitle = await page.title();
+    // Scrape all rows from the grid (handles multiple pages)
+    const gridRows = await scrapeStatusReportGrid(page);
+    logger.info({ count: gridRows.length }, "Columbus Data: scraped terminal grid rows");
 
-    // Log what's on the page regardless of whether selector was found
-    const pageElements = await page.evaluate(() => ({
-      url: window.location.href,
-      inputs: Array.from(document.querySelectorAll("input")).map((el) => ({
-        id: (el as HTMLInputElement).id,
-        name: (el as HTMLInputElement).name,
-        type: (el as HTMLInputElement).type,
-      })),
-      selects: Array.from(document.querySelectorAll("select")).map((el) => ({
-        id: (el as HTMLSelectElement).id,
-        name: (el as HTMLSelectElement).name,
-        optionCount: (el as HTMLSelectElement).options.length,
-      })),
-      terminalEls: Array.from(document.querySelectorAll("[id]"))
-        .filter((el) => /terminal/i.test((el as HTMLElement).id))
-        .map((el) => ({ id: (el as HTMLElement).id, tag: el.tagName })),
-    }));
-    logger.info({ statusUrl, statusTitle, terminalSelectorFound, ...pageElements }, "Columbus Data: status page state");
-
-    if (!terminalSelectorFound) {
-      const bodySnippet = await page.evaluate(() => document.body?.innerHTML?.slice(0, 3000) ?? "");
-      logger.warn({ bodySnippet }, "Columbus Data: terminal selector not found — body snippet");
-      throw new Error("Columbus Data: terminal selector not found on status page after 45s");
+    if (gridRows.length === 0) {
+      throw new Error("Columbus Data: no terminal rows found in status report grid");
     }
 
-    const terminals = await extractTerminalList(page);
-    logger.info({ count: terminals.length }, "Columbus Data: found terminals");
+    // ------------------------------------------------------------------
+    // Step 3: For each terminal, get today's transactions from the monitor
+    // ------------------------------------------------------------------
+    // Navigate to the terminal monitor page for transaction detail
+    logger.info({ url: MONITOR_URL }, "Columbus Data: navigating to terminal monitor for transactions");
+    page.goto(MONITOR_URL).catch(() => {});
 
-    if (terminals.length === 0) {
-      throw new Error("Columbus Data: no terminals found in dropdown");
-    }
+    const monitorFound = await page
+      .waitForSelector("[id*='radTerminalSelector']", { timeout: 30_000 })
+      .then(() => true).catch(() => false);
 
-    // -----------------------------------------------------------------------
-    // Step 4: Iterate through each terminal and scrape status
-    // -----------------------------------------------------------------------
+    logger.info({ monitorFound }, "Columbus Data: terminal monitor loaded");
+
     const results: ColumbusTerminalStatus[] = [];
 
-    for (let i = 0; i < terminals.length; i++) {
-      const { id: termId, label: termLabel } = terminals[i];
-      logger.info(
-        { termId, index: i + 1, total: terminals.length },
-        "Columbus Data: scraping terminal",
-      );
-
-      try {
-        // Select the terminal in the dropdown by setting ClientState + triggering postback
-        await selectTerminal(page, termId, termLabel);
-
-        // Click "Get Status" button
-        await Promise.all([
-          waitForAjaxComplete(page),
-          page.click("#btnGetStatus").catch(() =>
-            // Some pages auto-load on terminal select; if no button, just wait
-            waitForAjaxComplete(page),
-          ),
-        ]);
-
-        // Give Telerik RadAjax a moment to fully render
-        await page.waitForTimeout(1_500);
-
-        const status = await scrapeTerminalStatus(page, termId, termLabel);
-        results.push(status);
-      } catch (err) {
-        logger.warn(
-          { termId, err: err instanceof Error ? err.message : String(err) },
-          "Columbus Data: failed to scrape terminal, skipping",
-        );
-        results.push({
-          terminalId: termId,
-          terminalLabel: termLabel,
-          currentBalance: null,
-          surcharge: null,
-          lastContact: null,
-          makeModel: null,
-          dailyCashDispensed: null,
-          dailyTransactionCount: null,
-          isOnline: false,
-          transactions: [],
-        });
+    for (const row of gridRows) {
+      // Look up transactions for this terminal if the monitor is available
+      let transactions: ColumbusTransaction[] = [];
+      if (monitorFound) {
+        try {
+          transactions = await getTerminalTransactions(page, row.terminalId, row.terminalLabel);
+        } catch (err) {
+          logger.warn({ termId: row.terminalId, err: (err as Error).message }, "Columbus Data: transaction scrape failed, skipping");
+        }
       }
+      results.push({ ...row, transactions });
     }
 
+    logger.info({ count: results.length }, "Columbus Data: sync complete");
     return results;
   } finally {
-    if (browser) {
-      await browser.close().catch(() => {});
-    }
+    await browser?.close().catch(() => {});
   }
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Grid scraping (TerminalStatusReport.aspx)
 // ---------------------------------------------------------------------------
 
-/**
- * Try each selector in order; return the first one that matches a visible
- * element on the page, or null if none match.
- */
+interface GridRow {
+  terminalId: string;
+  terminalLabel: string;
+  currentBalance: number | null;
+  lastContact: string | null;
+  lastError: string | null;
+  isOnline: boolean;
+  surcharge: null;
+  makeModel: null;
+  dailyCashDispensed: null;
+  dailyTransactionCount: null;
+}
+
+async function setGridPageSize(page: Page, size: number): Promise<void> {
+  try {
+    // The Telerik pager has a page-size combo; type into its input and press Enter
+    const pageSizeInput = "#rgTermStatusReport_ctl00_ctl03_ctl01_PageSizeComboBox_Input";
+    const el = await page.$(pageSizeInput);
+    if (el) {
+      await el.triple_click?.() ?? await el.click({ clickCount: 3 });
+      await el.type(String(size));
+      await el.press("Enter");
+      await page.waitForTimeout(3_000); // wait for grid to reload
+      logger.info({ size }, "Columbus Data: set grid page size");
+    }
+  } catch {
+    // ignore — we'll just take whatever the default page size is
+  }
+}
+
+async function scrapeStatusReportGrid(page: Page): Promise<GridRow[]> {
+  const rows: GridRow[] = [];
+  let pageNum = 1;
+
+  while (true) {
+    logger.info({ pageNum }, "Columbus Data: scraping grid page");
+
+    const pageRows = await page.evaluate(() => {
+      function cellText(cell: Element): string {
+        return (cell.textContent || "").replace(/ /g, " ").trim();
+      }
+      function parseDollar(raw: string): number | null {
+        const cleaned = raw.replace(/[$,\s]/g, "");
+        const n = parseFloat(cleaned);
+        return isNaN(n) ? null : n;
+      }
+
+      // The RadGrid renders a <table> with id containing "rgTermStatusReport_ctl00"
+      const table = document.querySelector("table[id*='rgTermStatusReport_ctl00']") as HTMLTableElement | null;
+      if (!table) return [];
+
+      const result: {
+        terminalId: string; terminalLabel: string; currentBalance: number | null;
+        lastContact: string | null; lastError: string | null; isOnline: boolean;
+      }[] = [];
+
+      // Find header row to map column indices
+      const headerRow = table.querySelector("thead tr, tr.rgHeader");
+      const headers: string[] = [];
+      if (headerRow) {
+        headerRow.querySelectorAll("th, td").forEach((th) => {
+          headers.push(cellText(th).toLowerCase());
+        });
+      }
+
+      // Data rows — Telerik alternates between "rgRow" and "rgAltRow" classes
+      const dataRows = table.querySelectorAll("tr.rgRow, tr.rgAltRow");
+      dataRows.forEach((tr) => {
+        const cells = Array.from(tr.querySelectorAll("td"));
+        if (cells.length < 2) return;
+
+        // Try to find columns by header name first, otherwise use position
+        const idxOf = (keyword: string) => headers.findIndex((h) => h.includes(keyword));
+
+        const termIdIdx = idxOf("terminalid") !== -1 ? idxOf("terminalid") : 0;
+        const nameIdx = idxOf("name") !== -1 ? idxOf("name") : 1;
+        const balanceIdx = idxOf("cashbalance") !== -1 ? idxOf("cashbalance") : 3;
+        const lastContactIdx = idxOf("lastcommunication") !== -1 ? idxOf("lastcommunication") : -1;
+        const lastErrorIdx = idxOf("lasterror") !== -1 ? idxOf("lasterror") : -1;
+
+        const terminalId = cellText(cells[termIdIdx] ?? cells[0]);
+        if (!terminalId || terminalId === "Terminal ID") return; // skip header rows
+
+        const name = cells[nameIdx] ? cellText(cells[nameIdx]) : "";
+        const terminalLabel = name ? `${terminalId} - ${name}` : terminalId;
+        const balanceRaw = cells[balanceIdx] ? cellText(cells[balanceIdx]) : "";
+        const currentBalance = parseDollar(balanceRaw);
+        const lastContact = lastContactIdx >= 0 && cells[lastContactIdx] ? cellText(cells[lastContactIdx]) : null;
+        const lastError = lastErrorIdx >= 0 && cells[lastErrorIdx] ? cellText(cells[lastErrorIdx]) : null;
+
+        // Online if last contact within 24h
+        let isOnline = false;
+        if (lastContact) {
+          const d = new Date(lastContact);
+          if (!isNaN(d.getTime())) isOnline = Date.now() - d.getTime() < 24 * 3600_000;
+        }
+
+        result.push({ terminalId, terminalLabel, currentBalance, lastContact, lastError, isOnline });
+      });
+
+      return result;
+    });
+
+    for (const r of pageRows) {
+      rows.push({ ...r, surcharge: null, makeModel: null, dailyCashDispensed: null, dailyTransactionCount: null });
+    }
+
+    logger.info({ pageNum, rowsOnPage: pageRows.length, totalSoFar: rows.length }, "Columbus Data: grid page scraped");
+
+    // Check for a "next page" button and click it
+    const hasNext = await page.evaluate(() => {
+      const nextBtn = document.querySelector("a[title='Next Page'], input[title='Next Page'], .rgPageNext:not(.rgPageNextDisabled)");
+      if (nextBtn && !(nextBtn as HTMLElement).classList.contains("rgPageNextDisabled")) {
+        (nextBtn as HTMLElement).click();
+        return true;
+      }
+      return false;
+    });
+
+    if (!hasNext || pageRows.length === 0) break;
+    await page.waitForTimeout(2_500);
+    pageNum++;
+    if (pageNum > 20) break; // safety cap
+  }
+
+  return rows;
+}
+
+// ---------------------------------------------------------------------------
+// Per-terminal transaction scraping (TermIDStatus.aspx)
+// ---------------------------------------------------------------------------
+
+async function getTerminalTransactions(
+  page: Page,
+  termId: string,
+  termLabel: string,
+): Promise<ColumbusTransaction[]> {
+  // Select this terminal in the dropdown
+  await page.evaluate(
+    (id, label) => {
+      const inputs = Array.from(document.querySelectorAll("input[type=hidden]")) as HTMLInputElement[];
+      for (const input of inputs) {
+        if (input.id?.includes("radTerminalSelector_ClientState")) {
+          input.value = JSON.stringify({ value: id, text: label, logEntries: [], enabled: true, checkedIndices: [], checkedItemsTextOverFlow: "" });
+          break;
+        }
+      }
+      const visibleInput = document.querySelector("input[id*='radTerminalSelector_Input']") as HTMLInputElement | null;
+      if (visibleInput) visibleInput.value = label;
+
+      // Click matching <li> if dropdown is open
+      const li = Array.from(document.querySelectorAll("#cbsTerminals_radTerminalSelector_DropDown li"))
+        .find((el) => el.textContent?.trim().startsWith(id));
+      if (li) (li as HTMLElement).click();
+    },
+    termId,
+    termLabel,
+  );
+
+  await page.waitForTimeout(500);
+
+  // Click Get Status
+  const btnGetStatus = await page.$("#btnGetStatus");
+  if (btnGetStatus) {
+    await btnGetStatus.click();
+    await page.waitForTimeout(3_000);
+  }
+
+  // Scrape Table5 transactions
+  return await page.evaluate(() => {
+    function cellText(cell: Element): string {
+      return (cell.textContent || "").replace(/ /g, " ").trim();
+    }
+    function parseDollar(raw: string): number | null {
+      const cleaned = raw.replace(/[$,\s]/g, "");
+      const n = parseFloat(cleaned);
+      return isNaN(n) ? null : n;
+    }
+
+    const txs: {
+      transactedAt: string; cardNumber: string | null; transactionType: string | null;
+      amount: number | null; response: string | null; terminalBalance: number | null;
+    }[] = [];
+
+    const table5 = document.querySelector("#Table5");
+    if (!table5) return txs;
+
+    table5.querySelectorAll("tr").forEach((tr) => {
+      const cells = tr.querySelectorAll("td.tmDataGrid");
+      if (cells.length < 5) return;
+      const transactedAt = cellText(cells[0]);
+      if (!transactedAt) return;
+      txs.push({
+        transactedAt,
+        cardNumber: cellText(cells[1]) || null,
+        transactionType: cellText(cells[2]) || null,
+        amount: parseDollar(cellText(cells[3])),
+        response: cellText(cells[4]) || null,
+        terminalBalance: cells[5] ? parseDollar(cellText(cells[5])) : null,
+      });
+    });
+
+    return txs;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Helper: find visible input by trying selectors in order
+// ---------------------------------------------------------------------------
+
 async function findInputSelector(page: Page, selectors: string[]): Promise<string | null> {
   for (const sel of selectors) {
     try {
@@ -320,307 +393,10 @@ async function findInputSelector(page: Page, selectors: string[]): Promise<strin
         );
         if (visible) return sel;
       }
-    } catch {
-      // selector syntax error or element not found, try next
-    }
+    } catch { /* try next */ }
   }
   return null;
 }
 
-interface TerminalRef {
-  id: string;
-  label: string;
-}
-
-/**
- * Extract all terminal IDs from the Telerik RadComboBox dropdown.
- * The <li> items are only rendered after the dropdown is opened, so we
- * click the arrow first, wait for items to load, then read them.
- */
-async function extractTerminalList(page: Page): Promise<TerminalRef[]> {
-  // Click the dropdown arrow to open it and trigger option loading
-  const arrow = await page.$("#cbsTerminals_radTerminalSelector_Arrow");
-  if (arrow) {
-    await arrow.click();
-    // Wait for at least one <li> to appear inside the dropdown (up to 10s)
-    await page
-      .waitForSelector("#cbsTerminals_radTerminalSelector_DropDown li", { timeout: 10_000 })
-      .catch(() => {});
-    await page.waitForTimeout(1_000); // let remaining options render
-  }
-
-  // Read all <li> items — Telerik renders them with or without [id]
-  const fromLi = await page.evaluate(() => {
-    const items = document.querySelectorAll(
-      "#cbsTerminals_radTerminalSelector_DropDown li",
-    );
-    const result: { id: string; label: string }[] = [];
-    items.forEach((li) => {
-      const text = (li.textContent || "").trim();
-      if (!text) return;
-      // Terminal ID is the first whitespace-delimited token (e.g. "L443083")
-      const match = text.match(/^(\S+)/);
-      const id = match ? match[1] : text;
-      if (id) result.push({ id, label: text });
-    });
-    return result;
-  });
-
-  logger.info({ count: fromLi.length, sample: fromLi.slice(0, 3) }, "Columbus Data: dropdown list items");
-  if (fromLi.length > 0) return fromLi;
-
-  // Fallback: parse the hidden ClientState JSON (gives only the currently selected terminal)
-  const fromClientState = await page.evaluate(() => {
-    const inputs = Array.from(
-      document.querySelectorAll("input[type=hidden]"),
-    ) as HTMLInputElement[];
-    for (const input of inputs) {
-      if (input.id?.includes("radTerminalSelector_ClientState")) {
-        try {
-          const parsed = JSON.parse(input.value);
-          if (parsed?.value && parsed?.text) {
-            return [{ id: parsed.value as string, label: parsed.text as string }];
-          }
-        } catch {
-          // ignore
-        }
-      }
-    }
-    return [];
-  });
-
-  return fromClientState;
-}
-
-/**
- * Select a terminal via the Telerik RadComboBox.
- * Sets the ClientState hidden input and triggers the combobox change event.
- */
-async function selectTerminal(
-  page: Page,
-  termId: string,
-  termLabel: string,
-): Promise<void> {
-  await page.evaluate(
-    (id, label) => {
-      // Find and update the hidden ClientState input
-      const inputs = Array.from(
-        document.querySelectorAll("input[type=hidden]"),
-      ) as HTMLInputElement[];
-      for (const input of inputs) {
-        if (input.id?.includes("radTerminalSelector_ClientState")) {
-          input.value = JSON.stringify({
-            value: id,
-            text: label,
-            logEntries: [],
-            enabled: true,
-            checkedIndices: [],
-            checkedItemsTextOverFlow: "",
-          });
-          break;
-        }
-      }
-
-      // Also update the visible input (RadComboBox text box)
-      const visibleInput = document.querySelector(
-        "input[id*='radTerminalSelector_Input']",
-      ) as HTMLInputElement | null;
-      if (visibleInput) {
-        visibleInput.value = label;
-      }
-
-      // Try clicking the matching <li> if visible
-      const li = Array.from(
-        document.querySelectorAll(
-          "#cbsTerminals_radTerminalSelector_DropDown li",
-        ),
-      ).find((el) => el.textContent?.trim().startsWith(id));
-      if (li) {
-        (li as HTMLElement).click();
-      }
-    },
-    termId,
-    termLabel,
-  );
-
-  // Small pause so the combobox change handler fires
-  await page.waitForTimeout(500);
-}
-
-/**
- * Wait for any pending Telerik RadAjax request to finish.
- */
-async function waitForAjaxComplete(page: Page, timeoutMs = 15_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const busy = await page
-      .evaluate(() => {
-        try {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const ajax = (window as any).Telerik?.Web?.UI?.RadAjaxManager;
-          if (ajax) return false; // Can't easily check — just continue
-          const spinner = document.querySelector(".loading, .spinner, .ajaxLoading");
-          return spinner !== null;
-        } catch {
-          return false;
-        }
-      })
-      .catch(() => false);
-
-    if (!busy) break;
-    await page.waitForTimeout(300);
-  }
-  // Always give the DOM a moment to settle
-  await page.waitForTimeout(500);
-}
-
-/**
- * Scrape the terminal status and individual transactions from the current page state.
- */
-async function scrapeTerminalStatus(
-  page: Page,
-  termId: string,
-  termLabel: string,
-): Promise<ColumbusTerminalStatus> {
-  return await page.evaluate(
-    (termId, termLabel) => {
-      function cellText(cell: Element): string {
-        return (cell.textContent || "").replace(/ /g, " ").trim();
-      }
-
-      function queryText(selector: string): string | null {
-        const el = document.querySelector(selector);
-        return el ? cellText(el) : null;
-      }
-
-      function parseDollar(raw: string | null): number | null {
-        if (!raw) return null;
-        const cleaned = raw.replace(/[$,\s]/g, "");
-        const n = parseFloat(cleaned);
-        return isNaN(n) ? null : n;
-      }
-
-      // ------------------------------------------------------------------
-      // Current balance: <td id="curbalid" class="tmdata">$6,700.00</td>
-      // ------------------------------------------------------------------
-      const currentBalance = parseDollar(queryText("#curbalid"));
-
-      // ------------------------------------------------------------------
-      // Surcharge: "Current Surcharge: $3.50"
-      // ------------------------------------------------------------------
-      const surchargeRaw = queryText("#litCurrentSurchargePanel");
-      let surcharge: number | null = null;
-      if (surchargeRaw) {
-        const m = surchargeRaw.match(/\$([\d,.]+)/);
-        surcharge = m ? parseFloat(m[1].replace(",", "")) : null;
-      }
-
-      // ------------------------------------------------------------------
-      // Table3: machine info row
-      // Columns: Make/Model | Serial | Balance | Surcharge | Last Contact | ...
-      // ------------------------------------------------------------------
-      let makeModel: string | null = null;
-      let lastContact: string | null = null;
-
-      const table3 = document.querySelector("#Table3");
-      if (table3) {
-        const rows = table3.querySelectorAll("tr");
-        if (rows.length >= 2) {
-          const cells = rows[1].querySelectorAll("td");
-          if (cells[0]) makeModel = cellText(cells[0]) || null;
-          // Last contact is the 5th cell (index 4)
-          if (cells[4]) lastContact = cellText(cells[4]) || null;
-        }
-      }
-
-      // ------------------------------------------------------------------
-      // Table4: daily totals row
-      // Columns: Cash Disp | Total Trans | App W/D
-      // ------------------------------------------------------------------
-      let dailyCashDispensed: number | null = null;
-      let dailyTransactionCount: number | null = null;
-
-      const table4 = document.querySelector("#Table4");
-      if (table4) {
-        const rows = table4.querySelectorAll("tr");
-        for (let i = 1; i < rows.length; i++) {
-          const cells = rows[i].querySelectorAll("td");
-          if (cells.length >= 2) {
-            dailyCashDispensed = parseDollar(cellText(cells[0]));
-            dailyTransactionCount = parseInt(cellText(cells[1]), 10) || null;
-            break;
-          }
-        }
-      }
-
-      // ------------------------------------------------------------------
-      // Table5: individual transactions
-      // Columns: Date/Time | Card # | Type | Amount | Response | Terminal Bal
-      // Data rows have td.tmDataGrid cells
-      // ------------------------------------------------------------------
-      const transactions: {
-        transactedAt: string;
-        cardNumber: string | null;
-        transactionType: string | null;
-        amount: number | null;
-        response: string | null;
-        terminalBalance: number | null;
-      }[] = [];
-
-      const table5 = document.querySelector("#Table5");
-      if (table5) {
-        const rows = table5.querySelectorAll("tr");
-        for (let i = 0; i < rows.length; i++) {
-          // Transaction data rows have td.tmDataGrid cells
-          const cells = rows[i].querySelectorAll("td.tmDataGrid");
-          if (cells.length >= 5) {
-            const transactedAt = cellText(cells[0]);
-            const cardNumber = cellText(cells[1]) || null;
-            const transactionType = cellText(cells[2]) || null;
-            const amount = parseDollar(cellText(cells[3]));
-            const response = cellText(cells[4]) || null;
-            // Terminal balance is the 6th column (index 5) if present
-            const terminalBalance = cells[5] ? parseDollar(cellText(cells[5])) : null;
-
-            if (transactedAt) {
-              transactions.push({
-                transactedAt,
-                cardNumber,
-                transactionType,
-                amount,
-                response,
-                terminalBalance,
-              });
-            }
-          }
-        }
-      }
-
-      // ------------------------------------------------------------------
-      // Online status: last contact within 24 hours
-      // ------------------------------------------------------------------
-      let isOnline = false;
-      if (lastContact) {
-        const contactDate = new Date(lastContact);
-        if (!isNaN(contactDate.getTime())) {
-          isOnline = Date.now() - contactDate.getTime() < 24 * 60 * 60 * 1000;
-        }
-      }
-
-      return {
-        terminalId: termId,
-        terminalLabel: termLabel,
-        currentBalance,
-        surcharge,
-        lastContact,
-        makeModel,
-        dailyCashDispensed,
-        dailyTransactionCount,
-        isOnline,
-        transactions,
-      };
-    },
-    termId,
-    termLabel,
-  );
-}
+// keep export for type compatibility
+export type { findInputSelector };
