@@ -118,26 +118,70 @@ export async function scrapeColumbusData(
     logger.info("Columbus Data: navigating to login page");
     await page.goto(LOGIN_URL, { waitUntil: "networkidle2" });
 
-    // Fill username and password
-    await page.waitForSelector("#txtUserName", { visible: true });
-    await page.type("#txtUserName", username, { delay: 30 });
-    await page.type("#txtPassword", password, { delay: 30 });
+    // Dump all input field IDs/names so we can debug selector issues
+    const inputFields = await page.evaluate(() =>
+      Array.from(document.querySelectorAll("input")).map((el) => ({
+        id: el.id,
+        name: el.name,
+        type: el.type,
+      })),
+    );
+    logger.info({ inputFields }, "Columbus Data: login page inputs");
 
-    // Click the login button
+    // Find username field — try specific IDs first, then fall back to
+    // the first visible text/email input on the page
+    const userSelector = await findInputSelector(page, [
+      "#txtUserName",
+      "#txtUsername",
+      "#UserName",
+      "input[name*='UserName']",
+      "input[name*='userName']",
+      "input[name*='username']",
+      "input[type='text']:not([type='hidden'])",
+      "input[type='email']",
+    ]);
+    if (!userSelector) throw new Error("Columbus Data: could not find username field on login page");
+
+    const passSelector = await findInputSelector(page, [
+      "#txtPassword",
+      "#Password",
+      "input[name*='Password']",
+      "input[name*='password']",
+      "input[type='password']",
+    ]);
+    if (!passSelector) throw new Error("Columbus Data: could not find password field on login page");
+
+    // Find submit button
+    const submitSelector = await findInputSelector(page, [
+      "#btnLogin",
+      "#btnSubmit",
+      "input[type='submit']",
+      "button[type='submit']",
+      "input[value*='Login']",
+      "input[value*='Sign']",
+    ]);
+    if (!submitSelector) throw new Error("Columbus Data: could not find login button");
+
+    logger.info({ userSelector, passSelector, submitSelector }, "Columbus Data: found login fields");
+
+    await page.type(userSelector, username, { delay: 30 });
+    await page.type(passSelector, password, { delay: 30 });
+
+    // Click login and wait for navigation
     await Promise.all([
       page.waitForNavigation({ waitUntil: "networkidle2" }),
-      page.click("#btnLogin"),
+      page.click(submitSelector),
     ]);
 
     const currentUrl = page.url();
     logger.info({ currentUrl }, "Columbus Data: after login");
 
-    // Detect login failure
-    if (currentUrl.includes("login") || currentUrl.includes("Login")) {
-      const errorEl = await page.$(".errormessage, .error, #lblError");
+    // Detect login failure — still on a login-like URL
+    if (/login|Login|signin|SignIn/i.test(currentUrl)) {
+      const errorEl = await page.$(".errormessage, .error, #lblError, .alert, .message");
       const errorText = errorEl
         ? await page.evaluate((el) => el.textContent?.trim(), errorEl)
-        : "Unknown login error";
+        : "Still on login page — check credentials";
       throw new Error(`Columbus Data login failed: ${errorText}`);
     }
 
@@ -231,6 +275,28 @@ export async function scrapeColumbusData(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Try each selector in order; return the first one that matches a visible
+ * element on the page, or null if none match.
+ */
+async function findInputSelector(page: Page, selectors: string[]): Promise<string | null> {
+  for (const sel of selectors) {
+    try {
+      const el = await page.$(sel);
+      if (el) {
+        const visible = await page.evaluate(
+          (e) => !!(e as HTMLElement).offsetParent || (e as HTMLElement).style.display !== "none",
+          el,
+        );
+        if (visible) return sel;
+      }
+    } catch {
+      // selector syntax error or element not found, try next
+    }
+  }
+  return null;
+}
 
 interface TerminalRef {
   id: string;
