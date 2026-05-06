@@ -3,13 +3,14 @@ import { useListAtms, useCreateAtm, useUpdateAtm, useDeleteAtm, useGetAtmTransac
 import { useQuery } from "@tanstack/react-query";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useToast } from "@/hooks/use-toast";
-import { Search, Plus, RefreshCw, MapPin, Wifi, WifiOff, AlertTriangle, Upload, FileSpreadsheet, CheckCircle2, XCircle, Pencil, Trash2 } from "lucide-react";
+import { Search, Plus, RefreshCw, MapPin, Wifi, WifiOff, AlertTriangle, Upload, FileSpreadsheet, CheckCircle2, XCircle, Pencil, Trash2, SquareCheck, X } from "lucide-react";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 import type { Atm, CreateAtmBody } from "@workspace/api-client-react";
@@ -508,6 +509,100 @@ const emptyForm: CreateAtmBody = {
   avgDailyTransactions: undefined, avgDailyDispensed: undefined,
 };
 
+// ---------------------------------------------------------------------------
+// Bulk edit dialog
+// ---------------------------------------------------------------------------
+
+interface BulkEditFields {
+  lowCashThreshold: string;
+  cashCapacity: string;
+  portalSource: string;
+  status: string;
+}
+
+function BulkEditDialog({ ids, onClose, onSaved }: { ids: number[]; onClose: () => void; onSaved: () => void }) {
+  const { toast } = useToast();
+  const updateAtm = useUpdateAtm();
+  const [fields, setFields] = useState<BulkEditFields>({ lowCashThreshold: "", cashCapacity: "", portalSource: "", status: "" });
+  const [saving, setSaving] = useState(false);
+
+  const set = (k: keyof BulkEditFields, v: string) => setFields(f => ({ ...f, [k]: v }));
+
+  const handleSave = async () => {
+    const payload: Record<string, any> = {};
+    if (fields.lowCashThreshold !== "") payload.lowCashThreshold = Number(fields.lowCashThreshold);
+    if (fields.cashCapacity !== "") payload.cashCapacity = Number(fields.cashCapacity);
+    if (fields.portalSource !== "") payload.portalSource = fields.portalSource;
+    if (fields.status !== "") payload.status = fields.status;
+    if (Object.keys(payload).length === 0) { onClose(); return; }
+    setSaving(true);
+    try {
+      await Promise.all(ids.map(id => new Promise<void>((res, rej) =>
+        updateAtm.mutate({ id, data: payload as any }, { onSuccess: () => res(), onError: rej })
+      )));
+      toast({ title: `Updated ${ids.length} ATM${ids.length !== 1 ? "s" : ""}` });
+      onSaved();
+      onClose();
+    } catch {
+      toast({ title: "Some updates failed", variant: "destructive" });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Dialog open onOpenChange={onClose}>
+      <DialogContent className="sm:max-w-sm">
+        <DialogHeader>
+          <DialogTitle>Bulk Edit — {ids.length} ATM{ids.length !== 1 ? "s" : ""}</DialogTitle>
+          <p className="text-xs text-muted-foreground">Only filled fields will be updated. Leave blank to keep existing value.</p>
+        </DialogHeader>
+        <div className="grid gap-3 py-2">
+          <div>
+            <Label>Low Cash Threshold ($)</Label>
+            <Input type="number" placeholder="e.g. 2000" value={fields.lowCashThreshold} onChange={e => set("lowCashThreshold", e.target.value)} />
+          </div>
+          <div>
+            <Label>Cash Capacity ($)</Label>
+            <Input type="number" placeholder="e.g. 40000" value={fields.cashCapacity} onChange={e => set("cashCapacity", e.target.value)} />
+          </div>
+          <div>
+            <Label>Portal</Label>
+            <Select value={fields.portalSource} onValueChange={v => set("portalSource", v)}>
+              <SelectTrigger><SelectValue placeholder="Keep existing" /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="columbus_data">Columbus Data</SelectItem>
+                <SelectItem value="switch_commerce">Switch Commerce</SelectItem>
+                <SelectItem value="atm_transact">ATM Transact</SelectItem>
+                <SelectItem value="manual">Manual</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <div>
+            <Label>Status</Label>
+            <Select value={fields.status} onValueChange={v => set("status", v)}>
+              <SelectTrigger><SelectValue placeholder="Keep existing" /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="online">Online</SelectItem>
+                <SelectItem value="offline">Offline</SelectItem>
+                <SelectItem value="low_cash">Low Cash</SelectItem>
+                <SelectItem value="error">Error</SelectItem>
+                <SelectItem value="unknown">Unknown</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>Cancel</Button>
+          <Button onClick={handleSave} disabled={saving}>
+            {saving ? "Saving..." : `Apply to ${ids.length} ATM${ids.length !== 1 ? "s" : ""}`}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 export default function ATMFleet() {
   const { toast } = useToast();
   const [search, setSearch] = useState("");
@@ -520,6 +615,12 @@ export default function ATMFleet() {
   const [deleteTarget, setDeleteTarget] = useState<Atm | null>(null);
   const [form, setForm] = useState<CreateAtmBody>(emptyForm);
 
+  // Bulk selection state
+  const [checkedIds, setCheckedIds] = useState<Set<number>>(new Set());
+  const [showBulkEdit, setShowBulkEdit] = useState(false);
+  const [bulkDeleting, setBulkDeleting] = useState(false);
+  const [showBulkDeleteConfirm, setShowBulkDeleteConfirm] = useState(false);
+
   const { data: atms = [], refetch, isLoading } = useListAtms({
     search: search || undefined,
     status: statusFilter !== "all" ? statusFilter : undefined,
@@ -531,6 +632,36 @@ export default function ATMFleet() {
   const online = atms.filter(a => a.status === "online").length;
   const lowCash = atms.filter(a => a.status === "low_cash").length;
   const errors = atms.filter(a => a.status === "error").length;
+
+  const allChecked = atms.length > 0 && atms.every(a => checkedIds.has(a.id));
+  const someChecked = checkedIds.size > 0;
+
+  const toggleAll = () => {
+    if (allChecked) setCheckedIds(new Set());
+    else setCheckedIds(new Set(atms.map(a => a.id)));
+  };
+  const toggleOne = (id: number) => setCheckedIds(prev => {
+    const next = new Set(prev);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  });
+  const clearSelection = () => setCheckedIds(new Set());
+
+  const handleBulkDelete = async () => {
+    setBulkDeleting(true);
+    const ids = Array.from(checkedIds);
+    try {
+      await Promise.all(ids.map(id => fetch(`/api/atms/${id}`, { method: "DELETE" })));
+      toast({ title: `Removed ${ids.length} ATM${ids.length !== 1 ? "s" : ""}` });
+      clearSelection();
+      refetch();
+    } catch {
+      toast({ title: "Some deletions failed", variant: "destructive" });
+    } finally {
+      setBulkDeleting(false);
+      setShowBulkDeleteConfirm(false);
+    }
+  };
 
   return (
     <div>
@@ -589,18 +720,61 @@ export default function ATMFleet() {
         </Select>
       </div>
 
+      {/* Bulk action toolbar — appears when any row is selected */}
+      {someChecked && (
+        <div className="flex items-center gap-3 mb-3 px-4 py-2.5 bg-primary/5 border border-primary/20 rounded-lg">
+          <SquareCheck className="w-4 h-4 text-primary flex-shrink-0" />
+          <span className="text-sm font-medium">{checkedIds.size} selected</span>
+          <div className="flex gap-2 ml-auto">
+            <Button size="sm" variant="outline" onClick={() => setShowBulkEdit(true)}>
+              <Pencil className="w-3.5 h-3.5 mr-1" />Edit
+            </Button>
+            <Button size="sm" variant="outline" className="text-red-600 border-red-200 hover:bg-red-50 hover:border-red-300" onClick={() => setShowBulkDeleteConfirm(true)}>
+              <Trash2 className="w-3.5 h-3.5 mr-1" />Delete
+            </Button>
+            <Button size="sm" variant="ghost" className="h-8 w-8 p-0" onClick={clearSelection}>
+              <X className="w-3.5 h-3.5" />
+            </Button>
+          </div>
+        </div>
+      )}
+
       {/* ATM list */}
       {isLoading ? (
         <div className="text-center text-muted-foreground py-16">Loading...</div>
       ) : (
         <div className="border rounded-lg divide-y bg-card">
           {atms.length === 0 && <div className="py-12 text-center text-muted-foreground">No ATMs found</div>}
+
+          {/* Header row with select-all */}
+          {atms.length > 0 && (
+            <div className="flex items-center gap-4 px-4 py-2 bg-muted/30 rounded-t-lg">
+              <Checkbox
+                checked={allChecked}
+                onCheckedChange={toggleAll}
+                aria-label="Select all"
+              />
+              <span className="text-xs text-muted-foreground">{allChecked ? "Deselect all" : `Select all ${atms.length}`}</span>
+            </div>
+          )}
+
           {atms.map(atm => (
-            <div key={atm.id} className="flex items-center gap-4 p-4 hover:bg-muted/30 transition-colors group">
+            <div key={atm.id} className={`flex items-center gap-4 p-4 hover:bg-muted/30 transition-colors group ${checkedIds.has(atm.id) ? "bg-primary/5" : ""}`}>
+              <Checkbox
+                checked={checkedIds.has(atm.id)}
+                onCheckedChange={() => toggleOne(atm.id)}
+                onClick={e => e.stopPropagation()}
+                aria-label={`Select ${atm.locationName ?? atm.name}`}
+              />
               <MapPin className="w-4 h-4 text-muted-foreground flex-shrink-0" />
               <div className="flex-1 min-w-0 cursor-pointer" onClick={() => setSelected(atm)}>
-                <div className="flex items-center gap-2">
-                  <p className="font-medium text-sm truncate">{atm.name}</p>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <p className="font-medium text-sm truncate">
+                    {atm.locationName || atm.name}
+                    {atm.portalAtmId && (
+                      <span className="ml-1.5 font-mono text-xs text-muted-foreground font-normal">({atm.portalAtmId})</span>
+                    )}
+                  </p>
                   {statusBadge(atm.status)}
                 </div>
                 <p className="text-xs text-muted-foreground truncate">{atm.address}, {atm.city}, {atm.state}</p>
@@ -612,10 +786,10 @@ export default function ATMFleet() {
                 <p className="text-xs text-muted-foreground capitalize">{atm.portalSource?.replace(/_/g, " ")}</p>
               </div>
               <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0">
-                <Button variant="ghost" size="sm" className="h-8 w-8 p-0" onClick={() => setEditAtm(atm)}>
+                <Button variant="ghost" size="sm" className="h-8 w-8 p-0" onClick={e => { e.stopPropagation(); setEditAtm(atm); }}>
                   <Pencil className="w-3.5 h-3.5" />
                 </Button>
-                <Button variant="ghost" size="sm" className="h-8 w-8 p-0 text-red-500 hover:text-red-600 hover:bg-red-500/10" onClick={() => setDeleteTarget(atm)}>
+                <Button variant="ghost" size="sm" className="h-8 w-8 p-0 text-red-500 hover:text-red-600 hover:bg-red-500/10" onClick={e => { e.stopPropagation(); setDeleteTarget(atm); }}>
                   <Trash2 className="w-3.5 h-3.5" />
                 </Button>
               </div>
@@ -630,14 +804,41 @@ export default function ATMFleet() {
       {/* Edit Dialog */}
       <EditDialog atm={editAtm} onClose={() => setEditAtm(null)} onSaved={refetch} />
 
-      {/* Delete Confirmation */}
+      {/* Bulk Edit Dialog */}
+      {showBulkEdit && (
+        <BulkEditDialog
+          ids={Array.from(checkedIds)}
+          onClose={() => setShowBulkEdit(false)}
+          onSaved={() => { refetch(); clearSelection(); }}
+        />
+      )}
+
+      {/* Bulk Delete Confirmation */}
+      <Dialog open={showBulkDeleteConfirm} onOpenChange={setShowBulkDeleteConfirm}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Remove {checkedIds.size} ATM{checkedIds.size !== 1 ? "s" : ""}?</DialogTitle>
+          </DialogHeader>
+          <p className="text-sm text-muted-foreground">
+            This will permanently remove <span className="font-medium text-foreground">{checkedIds.size} ATM{checkedIds.size !== 1 ? "s" : ""}</span> from your fleet. This cannot be undone.
+          </p>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setShowBulkDeleteConfirm(false)}>Cancel</Button>
+            <Button variant="destructive" onClick={handleBulkDelete} disabled={bulkDeleting}>
+              {bulkDeleting ? "Removing..." : `Remove ${checkedIds.size} ATM${checkedIds.size !== 1 ? "s" : ""}`}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Single Delete Confirmation */}
       <Dialog open={!!deleteTarget} onOpenChange={() => setDeleteTarget(null)}>
         <DialogContent className="sm:max-w-sm">
           <DialogHeader>
             <DialogTitle>Remove ATM?</DialogTitle>
           </DialogHeader>
           <p className="text-sm text-muted-foreground">
-            This will permanently remove <span className="font-medium text-foreground">{deleteTarget?.name}</span> from your fleet. This cannot be undone.
+            This will permanently remove <span className="font-medium text-foreground">{deleteTarget?.locationName || deleteTarget?.name}</span> from your fleet. This cannot be undone.
           </p>
           <DialogFooter>
             <Button variant="outline" onClick={() => setDeleteTarget(null)}>Cancel</Button>
