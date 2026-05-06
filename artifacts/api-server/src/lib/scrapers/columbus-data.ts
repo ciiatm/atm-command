@@ -9,7 +9,34 @@
  */
 
 import puppeteer, { type Browser, type Page } from "puppeteer";
+import { execSync } from "node:child_process";
 import { logger } from "../logger.js";
+
+/**
+ * Find the system Chromium/Chrome executable.
+ * Checks CHROMIUM_PATH env first, then common binary names via `which`.
+ */
+function findChromiumExecutable(): string | undefined {
+  if (process.env.CHROMIUM_PATH) return process.env.CHROMIUM_PATH;
+  const candidates = [
+    "chromium-browser",
+    "chromium",
+    "google-chrome",
+    "google-chrome-stable",
+  ];
+  for (const bin of candidates) {
+    try {
+      const p = execSync(`which ${bin} 2>/dev/null`).toString().trim();
+      if (p) {
+        logger.info({ path: p }, "Columbus Data: found system Chromium");
+        return p;
+      }
+    } catch {
+      // not found, try next
+    }
+  }
+  return undefined; // let Puppeteer use its bundled chrome if present
+}
 
 const LOGIN_URL =
   "https://www.columbusdata.net/cdswebtool/login/login.aspx";
@@ -65,6 +92,9 @@ export async function scrapeColumbusData(
   let browser: Browser | null = null;
 
   try {
+    const executablePath = findChromiumExecutable();
+    logger.info({ executablePath: executablePath ?? "puppeteer-bundled" }, "Columbus Data: launching browser");
+
     browser = await puppeteer.launch({
       headless: true,
       args: [
@@ -75,8 +105,7 @@ export async function scrapeColumbusData(
         "--no-zygote",
         "--single-process",
       ],
-      // Use system chromium if available (set by env), otherwise puppeteer's bundled chrome
-      executablePath: process.env.CHROMIUM_PATH || undefined,
+      executablePath,
     });
 
     const page = await browser.newPage();

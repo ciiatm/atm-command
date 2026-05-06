@@ -61,9 +61,17 @@ export default function PortalsPage() {
       onSuccess: (data) => {
         refetch();
         setSyncingId(null);
-        toast({ title: `Sync complete: ${data.atmsUpdated} ATMs updated` });
+        if ((data as any).success === false) {
+          toast({ title: "Sync failed", description: (data as any).message ?? "Unknown error", variant: "destructive" });
+        } else {
+          toast({ title: `Sync complete: ${data.atmsUpdated} ATMs updated` });
+        }
       },
-      onError: () => { setSyncingId(null); toast({ title: "Sync failed", variant: "destructive" }); }
+      onError: (err: any) => {
+        setSyncingId(null);
+        const msg = err?.response?.data?.message ?? err?.message ?? "Unknown error";
+        toast({ title: "Sync failed", description: msg, variant: "destructive" });
+      }
     }
   });
   const { data: history = [] } = useGetPortalSyncHistory();
@@ -134,7 +142,7 @@ export default function PortalsPage() {
                 </div>
                 <span className="text-muted-foreground">{h.atmsUpdated ?? 0} ATMs updated</span>
                 {syncStatusBadge(h.success)}
-                {h.message && !h.success && <span className="text-xs text-red-500 truncate max-w-48">{h.message}</span>}
+                {h.message && !h.success && <span className="text-xs text-red-500 truncate max-w-xs" title={h.message}>{h.message}</span>}
               </div>
             ))}
           </div>

@@ -152,7 +152,6 @@ router.delete("/portals/:id", async (req, res) => {
   res.status(204).send();
 });
 
-// Simulate sync - in production this would use Puppeteer to scrape the portal
 router.post("/portals/:id/sync", async (req, res) => {
   const params = SyncPortalParams.safeParse({ id: Number(req.params.id) });
   if (!params.success) {
@@ -168,7 +167,14 @@ router.post("/portals/:id/sync", async (req, res) => {
     return;
   }
 
-  const result = await performPortalSync(portal);
+  let result: { success: boolean; message: string; atmsUpdated: number; alertsCreated: number };
+  try {
+    result = await performPortalSync(portal);
+  } catch (err) {
+    // Unhandled exception (e.g. puppeteer module not found, chromium crash)
+    const message = err instanceof Error ? err.message : String(err);
+    result = { success: false, message, atmsUpdated: 0, alertsCreated: 0 };
+  }
 
   // Update portal sync status
   await db
@@ -187,6 +193,7 @@ router.post("/portals/:id/sync", async (req, res) => {
     atmsUpdated: result.atmsUpdated,
   });
 
+  // Always return 200 so the frontend receives the message
   res.json({
     portalId: portal.id,
     portalName: PORTAL_CONFIG[portal.name]?.displayName ?? portal.name,
