@@ -175,8 +175,17 @@ export async function scrapeColumbusData(
       };
     });
 
-    logger.info({ count: results.length }, "Columbus Data: sync complete");
-    return results;
+    // Deduplicate by terminalId — the grid can return the same terminal on
+    // multiple pages if a filter or page-size change causes a partial reload.
+    const seen = new Set<string>();
+    const deduped = results.filter(r => {
+      if (seen.has(r.terminalId)) return false;
+      seen.add(r.terminalId);
+      return true;
+    });
+
+    logger.info({ scraped: results.length, deduped: deduped.length }, "Columbus Data: sync complete");
+    return deduped;
   } finally {
     await browser?.close().catch(() => {});
   }

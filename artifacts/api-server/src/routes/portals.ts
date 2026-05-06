@@ -261,6 +261,7 @@ router.get("/portals/sync-history", async (req, res) => {
       success: portalSyncHistoryTable.success,
       message: portalSyncHistoryTable.message,
       atmsUpdated: portalSyncHistoryTable.atmsUpdated,
+      durationSeconds: portalSyncHistoryTable.durationSeconds,
       syncedAt: portalSyncHistoryTable.syncedAt,
     })
     .from(portalSyncHistoryTable)
