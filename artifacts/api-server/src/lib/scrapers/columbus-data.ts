@@ -204,8 +204,8 @@ async function scrapeReportTable(
 ): Promise<Map<string, ReportRow>> {
   logger.info({ url }, `Columbus Data: scraping ${reportName}`);
 
-  // Navigate — fire-and-forget is safe here since we waitForSelector next
-  page.goto(url).catch(() => {});
+  // Proper await navigation — avoids race condition with waitForSelector
+  await page.goto(url, { waitUntil: "domcontentloaded" }).catch(() => {});
 
   // Wait for any table to appear
   await page.waitForSelector("table", { timeout: 20_000 }).catch(() => {});
@@ -222,9 +222,10 @@ async function scrapeReportTable(
   }).catch(() => false);
 
   if (clicked) {
-    // Wait for the report table to load after clicking
+    // Wait for the report table to reload after clicking
+    await new Promise(r => setTimeout(r, 1_000));
     await page.waitForSelector("table", { timeout: 25_000 }).catch(() => {});
-    await new Promise(r => setTimeout(r, 2_000));
+    await new Promise(r => setTimeout(r, 1_500));
   }
 
   // Scrape the table — try main frame then iframes
