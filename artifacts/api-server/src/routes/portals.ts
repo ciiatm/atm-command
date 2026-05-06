@@ -443,6 +443,7 @@ async function performColumbusDataSync(portal: {
             status: resolveStatus(ts, 2000),
             lastSynced: new Date(),
             ...(ts.makeModel ? { makeModel: ts.makeModel } : {}),
+            ...(ts.surcharge != null ? { surcharge: ts.surcharge } : {}),
             ...(ts.postalCode ? { postalCode: ts.postalCode } : {}),
             ...(ts.propertyType ? { propertyType: ts.propertyType } : {}),
           } as any)
@@ -467,6 +468,7 @@ async function performColumbusDataSync(portal: {
         status: newStatus,
         lastSynced: new Date(),
         ...(ts.makeModel ? { makeModel: ts.makeModel } : {}),
+        ...(ts.surcharge != null ? { surcharge: ts.surcharge } : {}),
         // Patch address/name only if the report gave us real data
         ...(ts.locationName ? { locationName: ts.locationName } : {}),
         ...(ts.address ? { address: ts.address } : {}),

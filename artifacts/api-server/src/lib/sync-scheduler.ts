@@ -61,6 +61,7 @@ async function syncPortal(portal: {
               status: newStatus,
               lastSynced: new Date(),
               ...(ts.makeModel ? { makeModel: ts.makeModel } : {}),
+              ...(ts.surcharge != null ? { surcharge: ts.surcharge } : {}),
               ...(ts.locationName ? { locationName: ts.locationName } : {}),
               ...(ts.address ? { address: ts.address } : {}),
               ...(ts.city ? { city: ts.city } : {}),
@@ -83,6 +84,7 @@ async function syncPortal(portal: {
             status: newStatus,
             lastSynced: new Date(),
             ...(ts.makeModel ? { makeModel: ts.makeModel } : {}),
+            ...(ts.surcharge != null ? { surcharge: ts.surcharge } : {}),
             ...(ts.postalCode ? { postalCode: ts.postalCode } : {}),
             ...(ts.propertyType ? { propertyType: ts.propertyType } : {}),
           } as any).returning();
