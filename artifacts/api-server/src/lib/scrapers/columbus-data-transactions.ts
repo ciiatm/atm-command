@@ -641,21 +641,69 @@ export async function debugScrapeTerminal(
         .map(el => `${el.name}=${el.value?.substring(0, 30) ?? ""}`)
     ).catch(() => []);
 
-    // Test 1a: postback with $ctl03$ctl00 (View Report button)
-    diag.postResult_ctl00 = await testPostback("ReportViewer1$ctl03$ctl00");
+    // Helper: postback with overrideable EVENTTARGET + EVENTARGUMENT + optional field overrides
+    async function testPostbackExt(target: string, argument: string, overrides: Record<string, string> = {}): Promise<string> {
+      return page.evaluate(async (t: string, arg: string, ov: Record<string, string>): Promise<string> => {
+        const form = document.querySelector<HTMLFormElement>("#form1, form");
+        if (!form) return "ERR:no-form";
+        const params = new URLSearchParams();
+        form.querySelectorAll<HTMLInputElement>("input, select, textarea").forEach(el => {
+          if (el.name && el.type !== "submit" && el.type !== "image" && el.type !== "button")
+            params.append(el.name, el.value ?? "");
+        });
+        params.set("__EVENTTARGET", t);
+        params.set("__EVENTARGUMENT", arg);
+        for (const [k, v] of Object.entries(ov)) params.set(k, v);
+        const sm = (window as any).Sys?.WebForms?.PageRequestManager?.getInstance?.();
+        const smId: string = sm?._scriptManagerID ?? "ScriptManager1";
+        params.set(smId, `${smId}|${t}`);
+        const resp = await fetch(form.action, {
+          method: "POST", credentials: "include",
+          headers: { "Content-Type": "application/x-www-form-urlencoded; charset=utf-8", "X-MicrosoftAjax": "Delta=true", "X-Requested-With": "XMLHttpRequest" },
+          body: params.toString(),
+        });
+        const text = await resp.text();
+        const sections: string[] = [];
+        let pos = 0;
+        while (pos < text.length && sections.length < 25) {
+          const p1 = text.indexOf("|", pos); if (p1 < 0) break;
+          const len = parseInt(text.substring(pos, p1), 10); if (isNaN(len)) break;
+          const p2 = text.indexOf("|", p1 + 1); if (p2 < 0) break;
+          const type = text.substring(p1 + 1, p2);
+          const p3 = text.indexOf("|", p2 + 1); if (p3 < 0) break;
+          const contentStart = p3 + 1;
+          if (contentStart + len > text.length) break;
+          const content = text.substring(contentStart, contentStart + len);
+          sections.push(`${type}(${len})`);
+          if (type === "updatePanel") sections.push(`PANEL_HTML[${len}]:${content.substring(0, 500)}`);
+          if (["panelsToRefreshIDs","updatePanelIDs","postBackControlIDs","error"].includes(type)) sections.push(`=${content}`);
+          pos = contentStart + len + 1;
+        }
+        return `STATUS:${resp.status} LEN:${text.length} SECTS:${JSON.stringify(sections)}`;
+      }, target, argument, overrides).catch((e: any) => `ERR:${(e as Error).message}`);
+    }
 
-    // Test 1b: postback with $ctl03 (parameter area — what Chrome DevTools showed)
-    diag.postResult_ctl03 = await testPostback("ReportViewer1$ctl03");
+    // Test A: $ctl09$ReportControl$ctl00 with Navigate1 (report control postback — what SSRS JS actually calls)
+    diag.postResult_reportCtl_Navigate1 = await testPostbackExt("ReportViewer1$ctl09$ReportControl$ctl00", "Navigate1");
 
-    // Export immediately after postback
+    // Test B: same but with browser mode = "full" (fix quirks mode detection)
+    diag.postResult_reportCtl_Navigate1_full = await testPostbackExt(
+      "ReportViewer1$ctl09$ReportControl$ctl00", "Navigate1",
+      { "ReportViewer1$ctl11": "full" }
+    );
+
+    // Test C: $ctl03 with browser mode = "full"
+    diag.postResult_ctl03_full = await testPostbackExt("ReportViewer1$ctl03", "", { "ReportViewer1$ctl11": "full" });
+
+    // Export after postbacks (no wait)
     if (controlId) {
       diag.exportResult_immediate = await testExport(controlId);
     }
 
-    // Wait 10s for async server-side render to complete, then try Export again
-    await sleep(10_000);
+    // Wait 5s then export again
+    await sleep(5_000);
     if (controlId) {
-      diag.exportResult_after10s = await testExport(controlId);
+      diag.exportResult_after5s = await testExport(controlId);
     }
 
     diag.pageUrl   = page.url();
