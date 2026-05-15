@@ -797,57 +797,86 @@ export async function debugScrapeTerminal(
     };
 
     // ── Test journal.aspx (Real-time Transactions → Online Journals) ──────
-    // journal.aspx is a simple HTML/ASP.NET page (no SSRS!). It has a form
-    // with terminal selector + date/time range + "View Journal" button.
-    // URL params TermID/StartDate/EndDate should pre-fill or be used via POST.
+    // Non-SSRS page. Terminal uses a Telerik RadComboBox that needs JS API to select.
     const journalBase = `https://www.columbusdata.net/cdswebtool/TerminalMonitoring/journal.aspx`;
     const journalUrl = `${journalBase}?TermID=${encodeURIComponent(termId)}&StartDate=${encodeURIComponent(formatDate(start))}&EndDate=${encodeURIComponent(formatDate(end))}`;
     diag.journalUrl = journalUrl;
     await page.goto(journalUrl, { waitUntil: "load" });
-    await sleep(1_000);
 
-    // Inspect form fields on journal.aspx
+    // Wait for Telerik JS to initialize (up to 5 s)
+    for (let i = 0; i < 10; i++) {
+      const ready = await page.evaluate(() => typeof (window as any).$find === "function").catch(() => false);
+      if (ready) break;
+      await sleep(500);
+    }
+    await sleep(500);
+
+    // Inspect form fields BEFORE submission
     diag.journalFormFields = await page.evaluate(() =>
-      Array.from(document.querySelectorAll("input, select, textarea, button[type=submit]"))
-        .filter((el: Element) => (el as HTMLInputElement).name || (el as HTMLButtonElement).type === "submit")
+      Array.from(document.querySelectorAll("input, select, textarea"))
+        .filter((el: Element) => !!(el as HTMLInputElement).name)
         .map((el: Element) => {
           const e = el as HTMLInputElement;
-          return `${e.tagName}[type=${e.type}][name=${e.name}][id=${e.id}] value=${(e.value||"").substring(0,30)}`;
+          return `${e.tagName}[type=${e.type}][name=${e.name}][id=${e.id}] value=${(e.value||"").substring(0,40)}`;
         })
     ).catch(() => []);
 
-    // Snapshot form fields BEFORE submission
-    diag.journalPreSubmitBody = (await page.content()).substring(0, 2000);
+    // Step 1: Inspect Telerik RadComboBox items (debug)
+    diag.journalDropdownItems = await page.evaluate(() => {
+      const w = window as any;
+      if (typeof w.$find !== "function") return { error: "$find not available" };
+      const combo = w.$find("cbsTerminals_radTerminalSelector");
+      if (!combo) return { error: "combo not found" };
+      const items = combo.get_items();
+      const result: Array<{text: string; value: string; index: number}> = [];
+      for (let i = 0; i < Math.min(items.get_count(), 10); i++) {
+        const item = items.getItem(i);
+        result.push({ text: item.get_text(), value: item.get_value(), index: i });
+      }
+      return { count: items.get_count(), first10: result };
+    }).catch((e: Error) => ({ error: String(e) }));
 
-    // Try to click "View Journal" button (standard CSS only — no :contains)
-    let journalSubmitClicked = false;
-    try {
-      // Try common submit button selectors
-      const btnSelectors = [
-        "input[value*='View']",
-        "input[id*='btnView']",
-        "input[id*='View'][type='submit']",
-        "button[type='submit']",
-        "input[type='submit']",
-      ];
-      for (const sel of btnSelectors) {
-        const btn = await page.$(sel);
-        if (btn) {
-          await Promise.all([
-            page.waitForNavigation({ waitUntil: "load", timeout: 10_000 }).catch(() => null),
-            btn.click(),
-          ]);
-          journalSubmitClicked = true;
-          diag.journalSubmitSelector = sel;
-          break;
+    // Step 2: Select terminal via Telerik JS API
+    diag.journalSelectResult = await page.evaluate((targetId: string) => {
+      const w = window as any;
+      if (typeof w.$find !== "function") return "no $find";
+      const combo = w.$find("cbsTerminals_radTerminalSelector");
+      if (!combo) return "combo not found";
+      const items = combo.get_items();
+      for (let i = 0; i < items.get_count(); i++) {
+        const item = items.getItem(i);
+        if (item.get_value() === targetId || item.get_text().includes(targetId)) {
+          item.select();
+          return `selected[${i}]: value=${item.get_value()} text=${item.get_text()}`;
         }
       }
-    } catch (e) {
-      diag.journalClickError = String(e);
-    }
+      // Fallback: type into the text box and fire change
+      const input = document.querySelector<HTMLInputElement>("#cbsTerminals_radTerminalSelector_Input");
+      if (input) {
+        input.value = targetId;
+        input.dispatchEvent(new Event("change", { bubbles: true }));
+        input.dispatchEvent(new Event("blur", { bubbles: true }));
+        return `typed ${targetId} into input`;
+      }
+      return "item not found, no input fallback";
+    }, termId).catch((e: Error) => String(e));
 
-    // If no button found, try direct form.submit() with waitForNavigation
-    if (!journalSubmitClicked) {
+    await sleep(500);
+
+    // Step 3: Click "View Journal" submit button with waitForNavigation
+    const submitBtnHandle = await page.$("input[type='submit']");
+    if (submitBtnHandle) {
+      try {
+        await Promise.all([
+          page.waitForNavigation({ waitUntil: "load", timeout: 15_000 }).catch(() => null),
+          submitBtnHandle.click(),
+        ]);
+        diag.journalSubmitSelector = "input[type='submit']";
+      } catch (e) {
+        diag.journalSubmitError = String(e);
+      }
+    } else {
+      // Fallback: form.submit()
       try {
         await Promise.all([
           page.waitForNavigation({ waitUntil: "load", timeout: 10_000 }).catch(() => null),
@@ -867,10 +896,10 @@ export async function debugScrapeTerminal(
     diag.journal = {
       url: page.url(),
       title: await page.title().catch(() => "(detached)"),
-      bodySnippet: (await page.content().catch(() => "")).substring(0, 3000),
+      bodySnippet: (await page.content().catch(() => "")).substring(0, 5000),
       domTables: await page.evaluate(() =>
         Array.from(document.querySelectorAll("table")).map(t => ({
-          id: t.id, rows: t.rows.length, text: (t.textContent ?? "").substring(0, 500),
+          id: t.id, rows: t.rows.length, text: (t.textContent ?? "").substring(0, 800),
         }))
       ).catch(() => []),
     };
