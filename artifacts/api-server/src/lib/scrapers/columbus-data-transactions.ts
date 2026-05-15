@@ -20,10 +20,11 @@ import puppeteer, { type Browser, type Page, type HTTPResponse, type HTTPRequest
 import { execSync } from "node:child_process";
 import { logger } from "../logger.js";
 
-const LOGIN_URL   = "https://www.columbusdata.net/cdswebtool/login/login.aspx";
-const REPORT_BASE = "https://www.columbusdata.net/cdswebtool/includes/ReportViewer.aspx";
-const REPORT_NAME = "rptTransactionDetailByTIDWithBalance";
+const LOGIN_URL    = "https://www.columbusdata.net/cdswebtool/login/login.aspx";
+const REPORT_BASE  = "https://www.columbusdata.net/cdswebtool/includes/ReportViewer.aspx";
+const REPORT_NAME  = "rptTransactionDetailByTIDWithBalance";
 const SSRS_HANDLER = "Reserved.ReportViewerWebControl.axd";
+const SSRS_VERSION = "12.0.2402.15";
 
 // Real-browser user-agent (Chrome 124 on macOS)
 const CHROME_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
@@ -557,8 +558,19 @@ export async function debugScrapeTerminal(
       };
     });
 
-    // ── Test the in-page fetch (UpdatePanel POST) approach ────────────────
-    const fetchResult = await page.evaluate(async (postbackTarget: string): Promise<string> => {
+    // Wait up to 5s for SessionKeepAlive to fire (gives us the ControlID)
+    let controlId: string | null = null;
+    const ctrlListener = (r: import("puppeteer").HTTPResponse) => {
+      const m = r.url().match(/[?&]ControlID=([a-f0-9]+)/i);
+      if (m) controlId = m[1];
+    };
+    page.on("response", ctrlListener);
+    await sleep(5_000);
+    page.off("response", ctrlListener);
+    diag.controlId = controlId;
+
+    // ── Test 1: UpdatePanel POST (no panel refresh expected — for info) ────
+    const postResult = await page.evaluate(async (postbackTarget: string): Promise<string> => {
       try {
         const form = document.querySelector<HTMLFormElement>("#form1, form");
         if (!form) return "ERR:no-form";
@@ -574,20 +586,14 @@ export async function debugScrapeTerminal(
         const smId: string = sm?._scriptManagerID ?? "ScriptManager1";
         params.set(smId, `${smId}|${postbackTarget}`);
         const resp = await fetch(form.action, {
-          method: "POST",
-          credentials: "include",
-          headers: {
-            "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
-            "X-MicrosoftAjax": "Delta=true",
-            "X-Requested-With": "XMLHttpRequest",
-          },
+          method: "POST", credentials: "include",
+          headers: { "Content-Type": "application/x-www-form-urlencoded; charset=utf-8", "X-MicrosoftAjax": "Delta=true", "X-Requested-With": "XMLHttpRequest" },
           body: params.toString(),
         });
         const text = await resp.text();
-        // Parse UpdatePanel sections to list types
         const sections: string[] = [];
         let pos = 0;
-        while (pos < text.length && sections.length < 30) {
+        while (pos < text.length && sections.length < 20) {
           const p1 = text.indexOf("|", pos); if (p1 < 0) break;
           const len = parseInt(text.substring(pos, p1), 10); if (isNaN(len)) break;
           const p2 = text.indexOf("|", p1 + 1); if (p2 < 0) break;
@@ -598,16 +604,43 @@ export async function debugScrapeTerminal(
           if (contentStart + len > text.length) break;
           const content = text.substring(contentStart, contentStart + len);
           sections.push(`${type}/${id}(${len})`);
-          if (type === "updatePanel") sections.push(`HTML_SNIPPET:${content.substring(0, 200)}`);
+          if (type === "updatePanel") sections.push(`PANEL:${content.substring(0, 300)}`);
           pos = contentStart + len + 1;
         }
-        return `STATUS:${resp.status} REDIRECTED:${resp.redirected} LEN:${text.length} SECTIONS:${JSON.stringify(sections)} TAIL:${text.substring(text.length - 200)}`;
-      } catch (e: any) {
-        return `ERR:${e?.message ?? "unknown"}`;
-      }
+        return `STATUS:${resp.status} LEN:${text.length} SECTIONS:${JSON.stringify(sections)}`;
+      } catch (e: any) { return `ERR:${e?.message ?? "unknown"}`; }
     }, "ReportViewer1$ctl03$ctl00").catch(() => "ERR:evaluate-threw");
+    diag.postResult = postResult;
 
-    diag.fetchResult = fetchResult;
+    // ── Test 2: OpType=Export CSV via in-page fetch ───────────────────────
+    if (controlId) {
+      const exportResult = await page.evaluate(async (ctrl: string, ver: string): Promise<string> => {
+        try {
+          const exportUrl = `/cdswebtool/Reserved.ReportViewerWebControl.axd?OpType=Export&Version=${encodeURIComponent(ver)}&ControlID=${ctrl}&Culture=en-US&UICulture=en-US&ReportStack=1&ExportFormat=CSV`;
+          const resp = await fetch(exportUrl, { credentials: "include" });
+          const text = await resp.text();
+          return `STATUS:${resp.status} REDIRECTED:${resp.redirected} URL:${resp.url} LEN:${text.length} SNIPPET:${text.substring(0, 600)}`;
+        } catch (e: any) { return `ERR:${e?.message}`; }
+      }, controlId, SSRS_VERSION).catch(() => "ERR:evaluate-threw");
+      diag.exportResult = exportResult;
+    } else {
+      diag.exportResult = "SKIPPED:no-controlId";
+    }
+
+    // ── Test 3: OpType=ReportPage via in-page fetch ───────────────────────
+    if (controlId) {
+      const reportPageResult = await page.evaluate(async (ctrl: string, ver: string): Promise<string> => {
+        try {
+          const url = `/cdswebtool/Reserved.ReportViewerWebControl.axd?OpType=ReportPage&Version=${encodeURIComponent(ver)}&ControlID=${ctrl}&Culture=en-US&UICulture=en-US&ReportStack=1&PageNumber=1&Format=HTML4.0&DeviceInfo=%3CDeviceInfo%3E%3CBackColor%3E%23FFFFFF%3C%2FBackColor%3E%3C%2FDeviceInfo%3E`;
+          const resp = await fetch(url, { credentials: "include" });
+          const text = await resp.text();
+          return `STATUS:${resp.status} REDIRECTED:${resp.redirected} URL:${resp.url} LEN:${text.length} SNIPPET:${text.substring(0, 600)}`;
+        } catch (e: any) { return `ERR:${e?.message}`; }
+      }, controlId, SSRS_VERSION).catch(() => "ERR:evaluate-threw");
+      diag.reportPageResult = reportPageResult;
+    } else {
+      diag.reportPageResult = "SKIPPED:no-controlId";
+    }
 
     diag.pageUrl   = page.url();
     diag.pageTitle = await page.title();
