@@ -557,36 +557,40 @@ export async function debugScrapeTerminal(
       };
     });
 
-    // Wait 15s then check if explicit __doPostBack is needed
-    await sleep(15_000);
-
-    diag.stateAt15s = await page.evaluate(() => {
-      return {
-        asyncWaitVisible: (document.getElementById("AsyncWaitReportViewer1") as HTMLElement)?.style.display !== "none",
-        bodySnippet: document.body?.innerHTML?.substring(0, 2000) ?? "",
-        tableCount: document.querySelectorAll("table").length,
-      };
-    });
-
-    // Explicitly fire postback if still stuck
-    const hasPostResponse = allResponses.some(r => r.method === "POST" && r.url.includes("ReportViewer"));
-    if (!hasPostResponse) {
-      logger.info("debug: no POST seen after 15s, calling __doPostBack explicitly");
-      await page.evaluate(() => {
-        try {
-          const btn = document.querySelector<HTMLInputElement>("#ReportViewer1_ctl03_ctl00, input[id*='ctl03_ctl00']");
-          if (btn) { btn.click(); return; }
-        } catch {}
-        try {
-          if (typeof (window as any).__doPostBack === "function") {
-            (window as any).__doPostBack("ReportViewer1$ctl03$ctl00", "");
+    // ── Test the in-page fetch (UpdatePanel POST) approach ────────────────
+    const fetchResult = await page.evaluate(async (postbackTarget: string): Promise<string> => {
+      try {
+        const form = document.querySelector<HTMLFormElement>("#form1, form");
+        if (!form) return "ERR:no-form";
+        const params = new URLSearchParams();
+        form.querySelectorAll<HTMLInputElement>("input, select, textarea").forEach(el => {
+          if (el.name && el.type !== "submit" && el.type !== "image" && el.type !== "button") {
+            params.append(el.name, el.value ?? "");
           }
-        } catch {}
-      });
-    }
+        });
+        params.set("__EVENTTARGET", postbackTarget);
+        params.set("__EVENTARGUMENT", "");
+        const sm = (window as any).Sys?.WebForms?.PageRequestManager?.getInstance?.();
+        const smId: string = sm?._scriptManagerID ?? "ScriptManager1";
+        params.set(smId, `${smId}|${postbackTarget}`);
+        const resp = await fetch(form.action, {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+            "X-MicrosoftAjax": "Delta=true",
+            "X-Requested-With": "XMLHttpRequest",
+          },
+          body: params.toString(),
+        });
+        const text = await resp.text();
+        return `STATUS:${resp.status} REDIRECTED:${resp.redirected} URL:${resp.url} LEN:${text.length} SNIPPET:${text.substring(0, 600)}`;
+      } catch (e: any) {
+        return `ERR:${e?.message ?? "unknown"}`;
+      }
+    }, "ReportViewer1$ctl03$ctl00").catch(() => "ERR:evaluate-threw");
 
-    // Wait another 30s
-    await sleep(30_000);
+    diag.fetchResult = fetchResult;
 
     diag.pageUrl   = page.url();
     diag.pageTitle = await page.title();
