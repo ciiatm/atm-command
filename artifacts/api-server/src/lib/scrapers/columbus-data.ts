@@ -76,7 +76,9 @@ export async function scrapeColumbusData(
     });
 
     const page = await browser.newPage();
-    page.setDefaultNavigationTimeout(60_000);
+    await page.setUserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
+    await page.setViewport({ width: 1280, height: 900 });
+    page.setDefaultNavigationTimeout(90_000);
     page.setDefaultTimeout(30_000);
 
     // ── 1. Login ──────────────────────────────────────────────────────────
@@ -193,45 +195,79 @@ async function scrapeReportViewer(
 ): Promise<Map<string, InfoRow>> {
   logger.info({ url, reportName }, "Columbus Data: loading report");
 
-  // Capture SSRS ControlID from any response URL (used for CSV export fallback)
+  // Capture ControlID + intercept UpdatePanel POST response
   let controlId: string | null = null;
-  const onResponse = (r: HTTPResponse) => {
+  let reportPayload: string | null = null;
+
+  const onResponse = async (r: HTTPResponse) => {
+    // ControlID from any SSRS handler URL
     const m = r.url().match(/[?&]ControlID=([a-f0-9]+)/i);
     if (m) controlId = m[1];
+
+    // UpdatePanel POST response to ReportViewer.aspx
+    if (r.request().method() === "POST" && r.url().includes("ReportViewer.aspx") && !reportPayload) {
+      const text = await r.text().catch(() => "");
+      if (text.length > 200) {
+        reportPayload = text;
+        logger.debug({ reportName, len: text.length }, "Columbus Data: captured UpdatePanel POST response");
+      }
+    }
+    // SSRS ReportPage XHR
+    if (r.url().includes("Reserved.ReportViewerWebControl.axd") && r.url().includes("OpType=ReportPage") && !reportPayload) {
+      const text = await r.text().catch(() => "");
+      if (text.length > 200) {
+        reportPayload = text;
+        logger.debug({ reportName, len: text.length }, "Columbus Data: captured ReportPage XHR");
+      }
+    }
   };
   page.on("response", onResponse);
 
   try {
-    // Hard navigate — do NOT swallow errors
-    await page.goto(url, { waitUntil: "domcontentloaded" });
+    await page.goto(url, { waitUntil: "load" });
 
-    // Give the page + SSRS JS time to initialise (KeepAlive POST fires → gives ControlID)
-    await new Promise(r => setTimeout(r, 3_000));
+    // Wait up to 10s for SSRS to auto-render
+    let waited = 0;
+    while (!reportPayload && waited < 10_000) {
+      await new Promise(r => setTimeout(r, 1_500));
+      waited += 1_500;
+    }
 
-    // Trigger the report.  SSRS ReportViewer v12 uses UpdatePanel postback;
-    // the "View Report" button target is ReportViewer1$ctl03.
-    const triggered = await page.evaluate(() => {
-      // Primary: UpdatePanel async postback (confirmed via DevTools investigation)
-      if (typeof (window as any).__doPostBack === "function") {
-        try { (window as any).__doPostBack("ReportViewer1$ctl03", ""); return "postback"; } catch {}
+    // Explicitly trigger if not rendered yet
+    if (!reportPayload) {
+      logger.info({ reportName }, "Columbus Data: explicit __doPostBack after 10s");
+      await page.evaluate(() => {
+        try {
+          const btn = document.querySelector<HTMLInputElement>("#ReportViewer1_ctl03_ctl00, input[id*='ctl03_ctl00']");
+          if (btn) { btn.click(); return; }
+        } catch {}
+        try {
+          if (typeof (window as any).__doPostBack === "function") {
+            (window as any).__doPostBack("ReportViewer1$ctl03$ctl00", "");
+          }
+        } catch {}
+      }).catch(() => {});
+    }
+
+    // Wait up to 60s total for report payload
+    const deadline = Date.now() + 60_000;
+    while (!reportPayload && Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 2_000));
+    }
+
+    // ── Try parsing UpdatePanel / HTML payload ────────────────────────────
+    if (reportPayload) {
+      const rows = parseUpdatePanelForInfo(reportPayload) ?? parseHtmlForInfo(reportPayload);
+      if (rows && rows.length > 0) {
+        logger.info({ reportName, count: rows.length, method: "payload" }, "Columbus Data: got info rows from payload");
+        const map = new Map<string, InfoRow>();
+        for (const row of rows) { if (row.terminalId) map.set(row.terminalId, row); }
+        return map;
       }
-      // Fallback: click any image/submit button (ctl07_img etc.)
-      const btn = Array.from(
-        document.querySelectorAll<HTMLElement>(
-          "input[type=submit], input[type=image], input[type=button], button"
-        )
-      ).find(el => {
-        const v = (el as HTMLInputElement).value || (el as HTMLButtonElement).textContent || el.getAttribute("title") || el.id || "";
-        return /view|submit|run|generate|report|ctl07/i.test(v) || (el as HTMLInputElement).type === "image";
-      });
-      if (btn) { btn.click(); return "button-click"; }
-      return "none";
-    }).catch(() => "error");
+      logger.debug({ reportName, snippet: reportPayload.substring(0, 400) }, "Columbus Data: payload captured but no rows parsed");
+    }
 
-    logger.info({ reportName, triggered }, "Columbus Data: report trigger");
-    await new Promise(r => setTimeout(r, 4_000));
-
-    // ── Try CSV export first (cleanest path) ────────────────────────────────
+    // ── Try CSV export ────────────────────────────────────────────────────
     if (controlId) {
       const csvRows = await tryInfoCSVExport(page, controlId, reportName);
       if (csvRows && csvRows.length > 0) {
@@ -242,34 +278,19 @@ async function scrapeReportViewer(
       }
     }
 
-    // ── Fall back: poll all frames (main + iframes) for up to 30 s ──────────
-    const deadline = Date.now() + 30_000;
+    // ── Final fallback: DOM table scan across all frames ──────────────────
+    const allFrames: Frame[] = [page.mainFrame(), ...page.frames().filter(f => f !== page.mainFrame())];
     let bestRows: InfoRow[] = [];
-
-    while (Date.now() < deadline) {
-      const allFrames: Frame[] = [page.mainFrame(), ...page.frames().filter(f => f !== page.mainFrame())];
-
-      logger.info({ reportName, frameCount: allFrames.length }, "Columbus Data: scanning frames");
-
-      for (const frame of allFrames) {
-        let frameUrl = "";
-        try { frameUrl = frame.url(); } catch { continue; }
-
-        const rows = await extractTableFromFrame(frame, reportName, frameUrl).catch(() => null);
-
-        if (rows && rows.length > 0) {
-          logger.info({ reportName, frameUrl, rowCount: rows.length, sample: rows[0] }, "Columbus Data: found report rows");
-          if (rows.length > bestRows.length) bestRows = rows;
-        }
-      }
-
-      if (bestRows.length > 0) break;
-      await new Promise(r => setTimeout(r, 3_000));
+    for (const frame of allFrames) {
+      let frameUrl = "";
+      try { frameUrl = frame.url(); } catch { continue; }
+      const rows = await extractTableFromFrame(frame, reportName, frameUrl).catch(() => null);
+      if (rows && rows.length > bestRows.length) bestRows = rows;
     }
 
     if (bestRows.length === 0) {
       const snippet = await page.evaluate(() => document.body?.innerText?.slice(0, 500) ?? "").catch(() => "");
-      logger.warn({ reportName, bodySnippet: snippet }, "Columbus Data: no rows found in any frame after 30s");
+      logger.warn({ reportName, bodySnippet: snippet }, "Columbus Data: no rows found after all attempts");
     }
 
     const map = new Map<string, InfoRow>();
@@ -279,6 +300,110 @@ async function scrapeReportViewer(
   } finally {
     page.off("response", onResponse);
   }
+}
+
+// Parse ASP.NET UpdatePanel pipe-delimited response
+function parseUpdatePanelForInfo(text: string): InfoRow[] | null {
+  if (!text.match(/^\d+\|/)) return null;
+  const htmlSections: string[] = [];
+  let pos = 0;
+  while (pos < text.length) {
+    const pipe1 = text.indexOf("|", pos);
+    if (pipe1 < 0) break;
+    const len = parseInt(text.substring(pos, pipe1), 10);
+    if (isNaN(len)) break;
+    const pipe2 = text.indexOf("|", pipe1 + 1);
+    if (pipe2 < 0) break;
+    const type = text.substring(pipe1 + 1, pipe2);
+    const pipe3 = text.indexOf("|", pipe2 + 1);
+    if (pipe3 < 0) break;
+    const contentStart = pipe3 + 1;
+    if (contentStart + len > text.length) break;
+    const content = text.substring(contentStart, contentStart + len);
+    if (type === "updatePanel" && content.includes("<table")) {
+      htmlSections.push(content);
+    }
+    pos = contentStart + len + 1;
+  }
+  for (const html of htmlSections) {
+    const rows = parseHtmlForInfo(html);
+    if (rows && rows.length > 0) return rows;
+  }
+  return null;
+}
+
+// Parse plain HTML for address info table
+function parseHtmlForInfo(html: string): InfoRow[] | null {
+  const stripTags = (s: string) =>
+    s.replace(/<[^>]+>/g, "").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/\s+/g, " ").trim();
+
+  const tableMatches = html.match(/<table[\s\S]*?<\/table>/gi) ?? [];
+  let best: InfoRow[] = [];
+
+  for (const tableHtml of tableMatches) {
+    const lower = tableHtml.toLowerCase();
+    let score = 0;
+    if (lower.includes("terminal")) score += 2;
+    if (lower.includes("address"))  score += 3;
+    if (lower.includes("location")) score += 2;
+    if (lower.includes("surcharge")) score += 2;
+    if (lower.includes("postal"))   score += 2;
+    if (score < 4) continue;
+
+    const rowMatches = tableHtml.match(/<tr[\s\S]*?<\/tr>/gi) ?? [];
+    if (rowMatches.length < 2) continue;
+
+    let headerIdx = -1;
+    let headers: string[] = [];
+    for (let i = 0; i < rowMatches.length; i++) {
+      const cellMatches = rowMatches[i].match(/<t[hd][^>]*>([\s\S]*?)<\/t[hd]>/gi) ?? [];
+      const texts = cellMatches.map(c => stripTags(c).toLowerCase().replace(/\s+/g, ""));
+      const joined = texts.join("");
+      if ((joined.includes("terminalid") || joined.includes("termid")) &&
+          (joined.includes("address") || joined.includes("location") || joined.includes("surcharge"))) {
+        headerIdx = i; headers = texts; break;
+      }
+    }
+    if (headerIdx < 0) continue;
+
+    const col = (kw: string) => headers.findIndex(h => h.includes(kw.replace(/\s+/g, "")));
+    const iTermId   = col("terminalid") >= 0 ? col("terminalid") : col("termid") >= 0 ? col("termid") : 0;
+    const iLocation = col("locationname") >= 0 ? col("locationname") : col("location") >= 0 ? col("location") : -1;
+    const iAddress  = col("address");
+    const iCity     = col("city");
+    const iState    = col("state") >= 0 ? col("state") : col("province");
+    const iPostal   = col("postal") >= 0 ? col("postal") : col("zip");
+    const iProp     = col("propertytype") >= 0 ? col("propertytype") : col("property") >= 0 ? col("property") : -1;
+    const iMake     = col("machinetype") >= 0 ? col("machinetype") : col("makemodel") >= 0 ? col("makemodel") : col("make") >= 0 ? col("make") : -1;
+    const iSurch    = col("surcharge") >= 0 ? col("surcharge") : col("fee") >= 0 ? col("fee") : -1;
+
+    const parseDollar = (s: string): number | null => {
+      const n = parseFloat(s.replace(/[$,\s]/g, "")); return isNaN(n) ? null : n;
+    };
+
+    const rows: InfoRow[] = [];
+    for (let i = headerIdx + 1; i < rowMatches.length; i++) {
+      const cellMatches = rowMatches[i].match(/<t[hd][^>]*>([\s\S]*?)<\/t[hd]>/gi) ?? [];
+      const cells = cellMatches.map(c => stripTags(c));
+      if (cells.length < 2) continue;
+      const terminalId = cells[iTermId] ?? "";
+      if (!terminalId || /^total|^grand|^sub/i.test(terminalId) || terminalId.length > 20) continue;
+      const g = (ix: number) => (ix >= 0 && cells[ix] ? cells[ix].trim() || null : null);
+      rows.push({
+        terminalId,
+        locationName: g(iLocation),
+        address:      g(iAddress),
+        city:         g(iCity),
+        state:        g(iState),
+        postalCode:   g(iPostal),
+        propertyType: g(iProp),
+        makeModel:    g(iMake),
+        surcharge:    iSurch >= 0 ? parseDollar(cells[iSurch] ?? "") : null,
+      });
+    }
+    if (rows.length > best.length) best = rows;
+  }
+  return best.length > 0 ? best : null;
 }
 
 // ---------------------------------------------------------------------------
