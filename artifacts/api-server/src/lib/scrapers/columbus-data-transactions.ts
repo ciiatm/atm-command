@@ -136,7 +136,19 @@ export async function scrapeColumbusTransactions(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Scrape one terminal — intercept UpdatePanel POST + OpType=ReportPage
+// Scrape one terminal
+//
+// Root-cause findings (from debug):
+//   - SSRS renders the report on the server during initial GET (URL params)
+//   - SSRS JS then requests OpType=ReportPage via an iframe navigation
+//   - That request redirects to cdsatm.com (server rejects it in headless mode)
+//   - No UpdatePanel POST fires at all
+//
+// Fix: bypass SSRS JS completely. After the page loads (giving us a valid
+//   ViewState + session), we fire the UpdatePanel POST ourselves from inside
+//   the page context via fetch(). This carries the real session cookies, the
+//   valid ViewState, and all required headers. The server renders the report
+//   and returns it in the UpdatePanel response.
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function scrapeOneTerminal(
@@ -151,97 +163,81 @@ async function scrapeOneTerminal(
     `&StartDate=${encodeURIComponent(startStr)}` +
     `&EndDate=${encodeURIComponent(endStr)}`;
 
-  // Collect any response that looks like report content
-  let reportPayload: { html: string; source: string } | null = null;
+  logger.debug({ termId }, "Columbus Tx: navigating");
+  await page.goto(url, { waitUntil: "load" });
 
-  const onResponse = async (response: HTTPResponse) => {
-    if (reportPayload) return; // already have data
+  // Make the UpdatePanel postback from WITHIN the page (so session cookies
+  // and origin headers are automatically correct)
+  const payload = await page.evaluate(async (postbackTarget: string): Promise<string | null> => {
     try {
-      const rUrl  = response.url();
-      const meth  = response.request().method();
-      const ctype = response.headers()["content-type"] ?? "";
+      const form = document.querySelector<HTMLFormElement>("#form1, form");
+      if (!form) return "ERR:no-form";
 
-      // UpdatePanel POST response (text/plain with pipe-delimited format)
-      const isUpdatePanel = meth === "POST" && rUrl.includes("ReportViewer.aspx");
-      // SSRS rendered-page response
-      const isReportPage  = rUrl.includes(SSRS_HANDLER) && rUrl.includes("OpType=ReportPage");
-
-      if (isUpdatePanel || isReportPage) {
-        const text = await response.text().catch(() => "");
-        if (text.length > 200) {
-          reportPayload = { html: text, source: isUpdatePanel ? "updatePanel" : "reportPage" };
-          logger.debug({ termId, len: text.length, source: reportPayload.source }, "Columbus Tx: captured report payload");
+      // Collect all form fields (hidden + text inputs)
+      const params = new URLSearchParams();
+      form.querySelectorAll<HTMLInputElement>("input, select, textarea").forEach(el => {
+        if (el.name && el.type !== "submit" && el.type !== "image" && el.type !== "button") {
+          params.append(el.name, el.value ?? "");
         }
-      }
-    } catch {}
-  };
+      });
 
-  page.on("response", onResponse);
+      // Override postback fields for UpdatePanel async POST
+      params.set("__EVENTTARGET", postbackTarget);
+      params.set("__EVENTARGUMENT", "");
 
-  try {
-    logger.debug({ termId }, "Columbus Tx: navigating");
-    await page.goto(url, { waitUntil: "load" });
+      // Add ScriptManager async-postback field
+      const sm = (window as any).Sys?.WebForms?.PageRequestManager?.getInstance?.();
+      const smId: string = sm?._scriptManagerID ?? "ScriptManager1";
+      params.set(smId, `${smId}|${postbackTarget}`);
 
-    // Total budget: 75s per terminal.
-    // First 10s: let SSRS auto-render; then force __doPostBack; then wait the rest.
-    const deadline = Date.now() + 75_000;
-    const autoDeadline = Date.now() + 10_000;
+      const resp = await fetch(form.action, {
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+          "X-MicrosoftAjax": "Delta=true",
+          "X-Requested-With": "XMLHttpRequest",
+        },
+        body: params.toString(),
+      });
 
-    while (!reportPayload && Date.now() < autoDeadline) {
-      await sleep(1_500);
+      if (!resp.ok) return `ERR:${resp.status}`;
+      return resp.text();
+    } catch (e: any) {
+      return `ERR:${e?.message ?? "unknown"}`;
     }
+  }, "ReportViewer1$ctl03$ctl00").catch(() => null);
 
-    // If SSRS hasn't auto-triggered, explicitly fire __doPostBack
-    if (!reportPayload) {
-      logger.debug({ termId }, "Columbus Tx: no auto-render after 10s, calling __doPostBack explicitly");
-      await page.evaluate(() => {
-        try {
-          const btn = document.querySelector<HTMLInputElement>(
-            "#ReportViewer1_ctl03_ctl00, input[id*='ctl03_ctl00']"
-          );
-          if (btn) { btn.click(); return; }
-        } catch {}
-        try {
-          if (typeof (window as any).__doPostBack === "function") {
-            (window as any).__doPostBack("ReportViewer1$ctl03$ctl00", "");
-          }
-        } catch {}
-      }).catch(() => {});
-    }
-
-    // Wait out remaining budget
-    while (!reportPayload && Date.now() < deadline) {
-      await sleep(2_000);
-    }
-
-    if (reportPayload) {
-      // Try UpdatePanel format first
-      const upRows = parseUpdatePanelResponse(reportPayload.html, termId);
-      if (upRows.length > 0) {
-        logger.debug({ termId, count: upRows.length, source: reportPayload.source }, "Columbus Tx: parsed from UpdatePanel");
-        return upRows;
-      }
-      // Try as raw HTML
-      const htmlRows = parseTransactionHtml(reportPayload.html, termId);
-      if (htmlRows.length > 0) {
-        logger.debug({ termId, count: htmlRows.length, source: reportPayload.source }, "Columbus Tx: parsed from HTML");
-        return htmlRows;
-      }
-      logger.debug({ termId, len: reportPayload.html.length, snippet: reportPayload.html.substring(0, 300) }, "Columbus Tx: payload captured but no rows found");
-    } else {
-      logger.warn({ termId }, "Columbus Tx: no report payload after 90s");
-    }
-
-    // Final fallback: DOM parse
-    const domRows = await parseTableFromDom(page, termId);
-    if (domRows.length > 0) {
-      logger.debug({ termId, count: domRows.length }, "Columbus Tx: parsed from DOM");
-    }
-    return domRows;
-
-  } finally {
-    page.off("response", onResponse);
+  if (!payload) {
+    logger.warn({ termId }, "Columbus Tx: in-page fetch returned null");
+    return await parseTableFromDom(page, termId);
   }
+
+  if (payload.startsWith("ERR:")) {
+    logger.warn({ termId, payload }, "Columbus Tx: in-page fetch error");
+    return await parseTableFromDom(page, termId);
+  }
+
+  logger.debug({ termId, len: payload.length, snippet: payload.substring(0, 200) }, "Columbus Tx: UpdatePanel response received");
+
+  // Try UpdatePanel pipe format first (ASP.NET async postback)
+  const upRows = parseUpdatePanelResponse(payload, termId);
+  if (upRows.length > 0) {
+    logger.debug({ termId, count: upRows.length }, "Columbus Tx: parsed from UpdatePanel response");
+    return upRows;
+  }
+
+  // Try as plain HTML (some SSRS versions return full HTML)
+  const htmlRows = parseTransactionHtml(payload, termId);
+  if (htmlRows.length > 0) {
+    logger.debug({ termId, count: htmlRows.length }, "Columbus Tx: parsed from HTML response");
+    return htmlRows;
+  }
+
+  logger.debug({ termId, payloadLen: payload.length, snippet: payload.substring(0, 400) }, "Columbus Tx: response captured but no rows parsed");
+
+  // DOM fallback (in case the response updated the page)
+  return await parseTableFromDom(page, termId);
 }
 
 function sleep(ms: number): Promise<void> {

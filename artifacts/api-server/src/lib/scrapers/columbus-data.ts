@@ -195,65 +195,49 @@ async function scrapeReportViewer(
 ): Promise<Map<string, InfoRow>> {
   logger.info({ url, reportName }, "Columbus Data: loading report");
 
-  // Capture ControlID + intercept UpdatePanel POST response
+  // Capture ControlID from SSRS KeepAlive (needed for CSV export fallback)
   let controlId: string | null = null;
-  let reportPayload: string | null = null;
-
-  const onResponse = async (r: HTTPResponse) => {
-    // ControlID from any SSRS handler URL
+  const onResponse = (r: HTTPResponse) => {
     const m = r.url().match(/[?&]ControlID=([a-f0-9]+)/i);
     if (m) controlId = m[1];
-
-    // UpdatePanel POST response to ReportViewer.aspx
-    if (r.request().method() === "POST" && r.url().includes("ReportViewer.aspx") && !reportPayload) {
-      const text = await r.text().catch(() => "");
-      if (text.length > 200) {
-        reportPayload = text;
-        logger.debug({ reportName, len: text.length }, "Columbus Data: captured UpdatePanel POST response");
-      }
-    }
-    // SSRS ReportPage XHR
-    if (r.url().includes("Reserved.ReportViewerWebControl.axd") && r.url().includes("OpType=ReportPage") && !reportPayload) {
-      const text = await r.text().catch(() => "");
-      if (text.length > 200) {
-        reportPayload = text;
-        logger.debug({ reportName, len: text.length }, "Columbus Data: captured ReportPage XHR");
-      }
-    }
   };
   page.on("response", onResponse);
 
   try {
     await page.goto(url, { waitUntil: "load" });
 
-    // Wait up to 10s for SSRS to auto-render
-    let waited = 0;
-    while (!reportPayload && waited < 10_000) {
-      await new Promise(r => setTimeout(r, 1_500));
-      waited += 1_500;
-    }
-
-    // Explicitly trigger if not rendered yet
-    if (!reportPayload) {
-      logger.info({ reportName }, "Columbus Data: explicit __doPostBack after 10s");
-      await page.evaluate(() => {
-        try {
-          const btn = document.querySelector<HTMLInputElement>("#ReportViewer1_ctl03_ctl00, input[id*='ctl03_ctl00']");
-          if (btn) { btn.click(); return; }
-        } catch {}
-        try {
-          if (typeof (window as any).__doPostBack === "function") {
-            (window as any).__doPostBack("ReportViewer1$ctl03$ctl00", "");
+    // Same root-cause as transactions: SSRS renders via OpType=ReportPage iframe
+    // navigation which redirects to cdsatm.com. Fire the UpdatePanel POST
+    // ourselves from inside the page context — that way session cookies and
+    // ViewState are automatically correct.
+    const reportPayload = await page.evaluate(async (postbackTarget: string): Promise<string | null> => {
+      try {
+        const form = document.querySelector<HTMLFormElement>("#form1, form");
+        if (!form) return null;
+        const params = new URLSearchParams();
+        form.querySelectorAll<HTMLInputElement>("input, select, textarea").forEach(el => {
+          if (el.name && el.type !== "submit" && el.type !== "image" && el.type !== "button") {
+            params.append(el.name, el.value ?? "");
           }
-        } catch {}
-      }).catch(() => {});
-    }
-
-    // Wait up to 60s total for report payload
-    const deadline = Date.now() + 60_000;
-    while (!reportPayload && Date.now() < deadline) {
-      await new Promise(r => setTimeout(r, 2_000));
-    }
+        });
+        params.set("__EVENTTARGET", postbackTarget);
+        params.set("__EVENTARGUMENT", "");
+        const sm = (window as any).Sys?.WebForms?.PageRequestManager?.getInstance?.();
+        const smId: string = sm?._scriptManagerID ?? "ScriptManager1";
+        params.set(smId, `${smId}|${postbackTarget}`);
+        const resp = await fetch(form.action, {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+            "X-MicrosoftAjax": "Delta=true",
+            "X-Requested-With": "XMLHttpRequest",
+          },
+          body: params.toString(),
+        });
+        return resp.ok ? resp.text() : null;
+      } catch { return null; }
+    }, "ReportViewer1$ctl03$ctl00").catch(() => null);
 
     // ── Try parsing UpdatePanel / HTML payload ────────────────────────────
     if (reportPayload) {
