@@ -705,55 +705,69 @@ export async function debugScrapeTerminal(
       }, target, argument, overrides).catch((e: any) => `ERR:${(e as Error).message}`);
     }
 
-    // ── Node.js-side OpType=ReportPage test (bypasses browser JS detection) ──
-    // If the server redirects our browser request to cdsatm.com but NOT a
-    // Node.js HTTP request, the problem is browser-JS-based detection.
-    // If BOTH redirect, the problem is server-side (IP/session/header check).
+    // ── Node.js-side SSRS requests (bypasses browser detection) ─────────────
     if (controlId) {
       try {
         const sessionCookies = await page.cookies();
         const cookieStr = sessionCookies.map(c => `${c.name}=${c.value}`).join("; ");
-        const reportPageUrl = `https://www.columbusdata.net/cdswebtool/Reserved.ReportViewerWebControl.axd?OpType=ReportPage&Version=${encodeURIComponent(SSRS_VERSION)}&ControlID=${controlId}&Culture=en-US&UICulture=en-US&ReportStack=1`;
-        const exportUrl     = `https://www.columbusdata.net/cdswebtool/Reserved.ReportViewerWebControl.axd?OpType=Export&Version=${encodeURIComponent(SSRS_VERSION)}&ControlID=${controlId}&Culture=en-US&UICulture=en-US&ReportStack=1&ExportFormat=CSV`;
+        diag.nodeFetch_cookies = sessionCookies.map(c => c.name); // Just names for safety
 
+        // Extract ControlID from page HTML/JS directly (may differ from SessionKeepAlive URL)
+        const pageControlId = await page.evaluate(() => {
+          // Try SSRS JS object
+          const rv = (window as any)?.$find?.("ReportViewer1");
+          if (rv) {
+            return rv._controlId ?? rv.get_controlId?.() ?? null;
+          }
+          // Try inline script search
+          const scripts = Array.from(document.querySelectorAll("script")).map(s => s.textContent ?? "");
+          for (const s of scripts) {
+            const m = s.match(/"controlId"\s*:\s*"([^"]+)"/i) ?? s.match(/controlId['"]\s*[:=]\s*['"]([^'"]+)['"]/i);
+            if (m) return m[1];
+          }
+          // Try hidden field
+          const stateField = document.querySelector<HTMLInputElement>('[name*="ClientState"]');
+          return stateField ? stateField.value.substring(0, 100) : null;
+        }).catch(() => null);
+        diag.pageControlId = pageControlId;
+
+        // 1. Test SessionKeepAlive from Node.js (verify ControlID is valid)
+        const keepAliveUrl = `https://www.columbusdata.net/cdswebtool/Reserved.ReportViewerWebControl.axd?OpType=SessionKeepAlive&ControlID=${controlId}`;
+        const kaResp = await fetch(keepAliveUrl, {
+          redirect: "manual",
+          headers: { "Cookie": cookieStr, "User-Agent": CHROME_UA, "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9", "Referer": diag.url as string },
+        });
+        diag.nodeFetch_SessionKeepAlive = { status: kaResp.status, location: kaResp.headers.get("location") ?? "" };
+
+        // 2. Test ReportPage (minimal params)
+        const rpMinUrl = `https://www.columbusdata.net/cdswebtool/Reserved.ReportViewerWebControl.axd?OpType=ReportPage&ControlID=${controlId}`;
+        const rpMinResp = await fetch(rpMinUrl, {
+          redirect: "manual",
+          headers: { "Cookie": cookieStr, "User-Agent": CHROME_UA, "Accept": "text/html,*/*;q=0.8", "Accept-Language": "en-US,en;q=0.9", "Referer": diag.url as string, "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "iframe" },
+        });
+        const rpMinBody = rpMinResp.status === 200 ? (await rpMinResp.text()).substring(0, 500) : "";
+        diag.nodeFetch_ReportPage_minimal = { status: rpMinResp.status, location: rpMinResp.headers.get("location") ?? "", bodySnippet: rpMinBody };
+
+        // 3. Test ReportPage (full params)
+        const reportPageUrl = `https://www.columbusdata.net/cdswebtool/Reserved.ReportViewerWebControl.axd?OpType=ReportPage&Version=${encodeURIComponent(SSRS_VERSION)}&ControlID=${controlId}&Culture=en-US&UICulture=en-US&ReportStack=1`;
         const rpResp = await fetch(reportPageUrl, {
           redirect: "manual",
-          headers: {
-            "Cookie": cookieStr,
-            "User-Agent": CHROME_UA,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": diag.url as string,
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Dest": "document",
-          },
+          headers: { "Cookie": cookieStr, "User-Agent": CHROME_UA, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8", "Accept-Language": "en-US,en;q=0.9", "Referer": diag.url as string, "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document" },
         });
         const rpLocation = rpResp.headers.get("location") ?? "";
-        const rpBody = rpResp.status === 200 ? (await rpResp.text()).substring(0, 500) : "";
-        diag.nodeFetch_ReportPage = {
-          status: rpResp.status,
-          redirected: rpResp.redirected,
-          location: rpLocation,
-          bodySnippet: rpBody,
-        };
+        const rpBody = rpResp.status === 200 ? (await rpResp.text()).substring(0, 800) : "";
+        diag.nodeFetch_ReportPage = { status: rpResp.status, location: rpLocation, bodySnippet: rpBody };
 
-        // If ReportPage returned 200, try Export from Node.js
-        if (rpResp.status === 200) {
-          await sleep(500);
-          const exResp = await fetch(exportUrl, {
-            headers: {
-              "Cookie": cookieStr,
-              "User-Agent": CHROME_UA,
-              "Accept": "*/*",
-              "Accept-Language": "en-US,en;q=0.9",
-              "Referer": diag.url as string,
-            },
-          });
-          const exText = await exResp.text();
-          diag.nodeFetch_Export = { status: exResp.status, len: exText.length, csvSnippet: exText.substring(0, 1000) };
-        } else {
-          diag.nodeFetch_Export = { skipped: `ReportPage returned ${rpResp.status}, location=${rpLocation}` };
-        }
+        // 4. Test Export directly from Node.js (after SessionKeepAlive)
+        const exportUrl = `https://www.columbusdata.net/cdswebtool/Reserved.ReportViewerWebControl.axd?OpType=Export&Version=${encodeURIComponent(SSRS_VERSION)}&ControlID=${controlId}&Culture=en-US&UICulture=en-US&ReportStack=1&ExportFormat=CSV`;
+        const exResp = await fetch(exportUrl, { headers: { "Cookie": cookieStr, "User-Agent": CHROME_UA, "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9", "Referer": diag.url as string } });
+        const exText = await exResp.text();
+        diag.nodeFetch_Export = { status: exResp.status, len: exText.length, csvSnippet: exText.substring(0, 400) };
+
+        // 5. Full URL of allRequests SessionKeepAlive (to see the FULL ControlID)
+        const skReq = allRequests.find(r => r.url.includes("SessionKeepAlive"));
+        diag.sessionKeepAliveFullUrl = skReq?.url ?? null;
+
       } catch (e: any) {
         diag.nodeFetch_Error = String(e?.message ?? e);
       }
