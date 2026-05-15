@@ -821,7 +821,35 @@ export async function debugScrapeTerminal(
         })
     ).catch(() => []);
 
-    // Step 1: Inspect Telerik RadComboBox items (debug)
+    // Step 1: Trigger RadComboBox LoadOnDemand to fetch items matching the terminal
+    diag.journalRequestItems = await page.evaluate((targetId: string) => {
+      const w = window as any;
+      if (typeof w.$find !== "function") return "no $find";
+      const combo = w.$find("cbsTerminals_radTerminalSelector");
+      if (!combo) return "combo not found";
+      // requestItems(text, fromStart) triggers server-side ItemsRequested AJAX
+      try {
+        combo.requestItems(targetId, false);
+        return `requestItems("${targetId}", false) called`;
+      } catch (e) {
+        return `requestItems error: ${e}`;
+      }
+    }, termId).catch((e: Error) => String(e));
+
+    // Wait up to 6 s for items to load via AJAX
+    let itemsLoaded = false;
+    for (let i = 0; i < 12; i++) {
+      await sleep(500);
+      const count = await page.evaluate(() => {
+        const w = window as any;
+        const combo = w.$find?.("cbsTerminals_radTerminalSelector");
+        return combo?.get_items().get_count() ?? 0;
+      }).catch(() => 0);
+      if (count > 0) { itemsLoaded = true; break; }
+    }
+    diag.journalItemsLoaded = itemsLoaded;
+
+    // Step 2: Inspect items + select target terminal
     diag.journalDropdownItems = await page.evaluate(() => {
       const w = window as any;
       if (typeof w.$find !== "function") return { error: "$find not available" };
@@ -836,7 +864,6 @@ export async function debugScrapeTerminal(
       return { count: items.get_count(), first10: result };
     }).catch((e: Error) => ({ error: String(e) }));
 
-    // Step 2: Select terminal via Telerik JS API
     diag.journalSelectResult = await page.evaluate((targetId: string) => {
       const w = window as any;
       if (typeof w.$find !== "function") return "no $find";
@@ -850,28 +877,42 @@ export async function debugScrapeTerminal(
           return `selected[${i}]: value=${item.get_value()} text=${item.get_text()}`;
         }
       }
-      // Fallback: type into the text box and fire change
+      // Items still 0: set text input directly + craft ClientState
       const input = document.querySelector<HTMLInputElement>("#cbsTerminals_radTerminalSelector_Input");
-      if (input) {
+      const stateInput = document.querySelector<HTMLInputElement>("#cbsTerminals_radTerminalSelector_ClientState");
+      if (input && stateInput) {
         input.value = targetId;
-        input.dispatchEvent(new Event("change", { bubbles: true }));
-        input.dispatchEvent(new Event("blur", { bubbles: true }));
-        return `typed ${targetId} into input`;
+        // Craft ClientState JSON to tell server an item with this value is selected
+        stateInput.value = JSON.stringify({
+          logEntries: [{ type: 5, index: 0, value: targetId, text: targetId }],
+          selectedIndices: [0],
+        });
+        return `set text=${targetId} + crafted ClientState`;
       }
       return "item not found, no input fallback";
     }, termId).catch((e: Error) => String(e));
 
     await sleep(500);
 
-    // Step 3: Click "View Journal" submit button with waitForNavigation
-    const submitBtnHandle = await page.$("input[type='submit']");
-    if (submitBtnHandle) {
+    // Step 3: Find and click "View Journal" button — it may be any clickable element
+    diag.journalAllButtons = await page.evaluate(() =>
+      Array.from(document.querySelectorAll("input[type='submit'], input[type='button'], button, a"))
+        .map(el => `${el.tagName}[type=${(el as HTMLInputElement).type}] text=${(el.textContent||"").trim().substring(0,40)} id=${el.id}`)
+        .filter(s => s.includes("Journal") || s.includes("View") || s.includes("submit"))
+    ).catch(() => []);
+
+    const journalBtnHandle =
+      await page.$("input[type='submit']") ||
+      await page.$("input[type='button'][value*='View']") ||
+      await page.$("a[id*='View'], a[id*='Journal']");
+
+    if (journalBtnHandle) {
       try {
         await Promise.all([
           page.waitForNavigation({ waitUntil: "load", timeout: 15_000 }).catch(() => null),
-          submitBtnHandle.click(),
+          journalBtnHandle.click(),
         ]);
-        diag.journalSubmitSelector = "input[type='submit']";
+        diag.journalSubmitSelector = "found button";
       } catch (e) {
         diag.journalSubmitError = String(e);
       }
