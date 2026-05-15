@@ -821,39 +821,36 @@ export async function debugScrapeTerminal(
         })
     ).catch(() => []);
 
-    // Step 1: Trigger RadComboBox LoadOnDemand to fetch items matching the terminal
-    diag.journalRequestItems = await page.evaluate((targetId: string) => {
-      const w = window as any;
-      if (typeof w.$find !== "function") return "no $find";
-      const combo = w.$find("cbsTerminals_radTerminalSelector");
-      if (!combo) return "combo not found";
-      // requestItems(text, fromStart) triggers server-side ItemsRequested AJAX
-      try {
-        combo.requestItems(targetId, false);
-        return `requestItems("${targetId}", false) called`;
-      } catch (e) {
-        return `requestItems error: ${e}`;
-      }
-    }, termId).catch((e: Error) => String(e));
+    // Capture lnkView outerHTML + form dates info before manipulating
+    diag.journalPreInfo = await page.evaluate(() => {
+      const lnk = document.getElementById("lnkView");
+      const beginInput = document.getElementById("txtBeginDateTime1") as HTMLInputElement;
+      const endInput = document.getElementById("txtEndingDateTime1") as HTMLInputElement;
+      return {
+        lnkViewHtml: lnk?.outerHTML ?? "not found",
+        beginDate: beginInput?.value ?? "n/a",
+        endDate: endInput?.value ?? "n/a",
+        doPostBackExists: typeof (window as any).__doPostBack === "function",
+      };
+    }).catch((e: Error) => ({ error: String(e) }));
 
-    // Wait up to 6 s for items to load via AJAX
-    let itemsLoaded = false;
-    for (let i = 0; i < 12; i++) {
-      await sleep(500);
-      const count = await page.evaluate(() => {
-        const w = window as any;
-        const combo = w.$find?.("cbsTerminals_radTerminalSelector");
-        return combo?.get_items().get_count() ?? 0;
-      }).catch(() => 0);
-      if (count > 0) { itemsLoaded = true; break; }
+    // Step 1: Set terminal via type-to-search (triggers real Telerik keyup events)
+    const comboInput = await page.$("#cbsTerminals_radTerminalSelector_Input");
+    if (comboInput) {
+      await (comboInput as any).triple_click?.().catch(() => null);
+      await page.click("#cbsTerminals_radTerminalSelector_Input");
+      await page.evaluate(() => {
+        const el = document.getElementById("cbsTerminals_radTerminalSelector_Input") as HTMLInputElement;
+        if (el) { el.value = ""; el.select(); }
+      });
+      await page.type("#cbsTerminals_radTerminalSelector_Input", termId, { delay: 80 });
+      await sleep(2_000); // Wait for Telerik AJAX dropdown to appear
     }
-    diag.journalItemsLoaded = itemsLoaded;
 
-    // Step 2: Inspect items + select target terminal
+    // Check if items loaded after typing
     diag.journalDropdownItems = await page.evaluate(() => {
       const w = window as any;
-      if (typeof w.$find !== "function") return { error: "$find not available" };
-      const combo = w.$find("cbsTerminals_radTerminalSelector");
+      const combo = w.$find?.("cbsTerminals_radTerminalSelector");
       if (!combo) return { error: "combo not found" };
       const items = combo.get_items();
       const result: Array<{text: string; value: string; index: number}> = [];
@@ -864,72 +861,66 @@ export async function debugScrapeTerminal(
       return { count: items.get_count(), first10: result };
     }).catch((e: Error) => ({ error: String(e) }));
 
+    // Try to select item from loaded dropdown, or craft ClientState fallback
     diag.journalSelectResult = await page.evaluate((targetId: string) => {
       const w = window as any;
-      if (typeof w.$find !== "function") return "no $find";
-      const combo = w.$find("cbsTerminals_radTerminalSelector");
+      const combo = w.$find?.("cbsTerminals_radTerminalSelector");
       if (!combo) return "combo not found";
       const items = combo.get_items();
-      for (let i = 0; i < items.get_count(); i++) {
-        const item = items.getItem(i);
-        if (item.get_value() === targetId || item.get_text().includes(targetId)) {
-          item.select();
-          return `selected[${i}]: value=${item.get_value()} text=${item.get_text()}`;
+      if (items.get_count() > 0) {
+        for (let i = 0; i < items.get_count(); i++) {
+          const item = items.getItem(i);
+          if (item.get_value() === targetId || item.get_text().includes(targetId)) {
+            item.select();
+            return `selected[${i}]: value=${item.get_value()} text=${item.get_text()}`;
+          }
         }
+        return `items loaded (${items.get_count()}) but ${targetId} not found`;
       }
-      // Items still 0: set text input directly + craft ClientState
-      const input = document.querySelector<HTMLInputElement>("#cbsTerminals_radTerminalSelector_Input");
-      const stateInput = document.querySelector<HTMLInputElement>("#cbsTerminals_radTerminalSelector_ClientState");
+      // Fallback: directly set inputs + craft ClientState
+      const input = document.getElementById("cbsTerminals_radTerminalSelector_Input") as HTMLInputElement;
+      const stateInput = document.getElementById("cbsTerminals_radTerminalSelector_ClientState") as HTMLInputElement;
       if (input && stateInput) {
         input.value = targetId;
-        // Craft ClientState JSON to tell server an item with this value is selected
         stateInput.value = JSON.stringify({
           logEntries: [{ type: 5, index: 0, value: targetId, text: targetId }],
           selectedIndices: [0],
         });
-        return `set text=${targetId} + crafted ClientState`;
+        return `crafted ClientState: text=${targetId}`;
       }
-      return "item not found, no input fallback";
+      return "no fallback available";
     }, termId).catch((e: Error) => String(e));
 
-    await sleep(500);
+    // Step 2: Fix date range — set to 60 days back (the form shows 24h default)
+    const startFmt = `${start.getFullYear()}-${String(start.getMonth()+1).padStart(2,"0")}-${String(start.getDate()).padStart(2,"0")}-00-00-00`;
+    const endFmt   = `${end.getFullYear()}-${String(end.getMonth()+1).padStart(2,"0")}-${String(end.getDate()).padStart(2,"0")}-23-59-00`;
+    const startDisplay = `${start.getMonth()+1}/${start.getDate()}/${start.getFullYear()} 12:00 AM`;
+    const endDisplay   = `${end.getMonth()+1}/${end.getDate()}/${end.getFullYear()} 11:59 PM`;
+    diag.journalDateSet = await page.evaluate((sf: string, ef: string, sd: string, ed: string) => {
+      const s = (id: string) => document.getElementById(id) as HTMLInputElement;
+      if (s("txtBeginDateTime1")) s("txtBeginDateTime1").value = sf;
+      if (s("txtBeginDateTime1_dateInput")) s("txtBeginDateTime1_dateInput").value = sd;
+      if (s("txtEndingDateTime1")) s("txtEndingDateTime1").value = ef;
+      if (s("txtEndingDateTime1_dateInput")) s("txtEndingDateTime1_dateInput").value = ed;
+      return `begin=${sf} end=${ef}`;
+    }, startFmt, endFmt, startDisplay, endDisplay).catch((e: Error) => String(e));
 
-    // Step 3: Find and click "View Journal" button — it may be any clickable element
-    diag.journalAllButtons = await page.evaluate(() =>
-      Array.from(document.querySelectorAll("input[type='submit'], input[type='button'], button, a"))
-        .map(el => `${el.tagName}[type=${(el as HTMLInputElement).type}] text=${(el.textContent||"").trim().substring(0,40)} id=${el.id}`)
-        .filter(s => s.includes("Journal") || s.includes("View") || s.includes("submit"))
-    ).catch(() => []);
-
-    const journalBtnHandle =
-      await page.$("input[type='submit']") ||
-      await page.$("input[type='button'][value*='View']") ||
-      await page.$("a[id*='View'], a[id*='Journal']");
-
-    if (journalBtnHandle) {
-      try {
-        await Promise.all([
-          page.waitForNavigation({ waitUntil: "load", timeout: 15_000 }).catch(() => null),
-          journalBtnHandle.click(),
-        ]);
-        diag.journalSubmitSelector = "found button";
-      } catch (e) {
-        diag.journalSubmitError = String(e);
-      }
-    } else {
-      // Fallback: form.submit()
-      try {
-        await Promise.all([
-          page.waitForNavigation({ waitUntil: "load", timeout: 10_000 }).catch(() => null),
-          page.evaluate(() => {
-            const form = document.querySelector<HTMLFormElement>("#Form1, form");
-            form?.submit();
-          }),
-        ]);
-        diag.journalSubmitMethod = "form.submit()";
-      } catch (e) {
-        diag.journalSubmitError = String(e);
-      }
+    // Step 3: Submit — try __doPostBack('lnkView','') first, then form.submit()
+    try {
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: "load", timeout: 15_000 }).catch(() => null),
+        page.evaluate(() => {
+          const w = window as any;
+          if (typeof w.__doPostBack === "function") {
+            w.__doPostBack("lnkView", "");
+          } else {
+            (document.querySelector<HTMLFormElement>("#Form1, form"))?.submit();
+          }
+        }),
+      ]);
+      diag.journalSubmitMethod = "__doPostBack(lnkView) or form.submit()";
+    } catch (e) {
+      diag.journalSubmitError = String(e);
     }
 
     await sleep(1_000);
