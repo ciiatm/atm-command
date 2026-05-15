@@ -385,17 +385,18 @@ export async function debugScrapeTerminal(
     const start = new Date();
     start.setDate(start.getDate() - 60);
 
-    // Intercept ALL SSRS handler requests to see what's being fired
+    // Intercept ALL XHRs to see what's being fired (not just SSRS handler)
     const ssrsRequests: { url: string; status: number; bodyLen: number; snippet: string }[] = [];
     page.on("response", async (resp) => {
       try {
-        if (resp.url().includes(SSRS_HANDLER)) {
+        const url = resp.url();
+        if (url.includes("columbusdata.net") && !url.includes("OpType=Resource")) {
           const text = await resp.text().catch(() => "");
           ssrsRequests.push({
-            url: resp.url().replace(/https?:\/\/[^/]+/, ""),
+            url: url.replace(/https?:\/\/[^/]+/, ""),
             status: resp.status(),
             bodyLen: text.length,
-            snippet: text.substring(0, 300),
+            snippet: text.substring(0, 500),
           });
         }
       } catch {}
@@ -410,8 +411,8 @@ export async function debugScrapeTerminal(
     diag.url = url;
     await page.goto(url, { waitUntil: "domcontentloaded" });
 
-    // Wait 20s to observe all SSRS XHRs
-    await new Promise(r => setTimeout(r, 20_000));
+    // Wait 35s to observe all SSRS XHRs
+    await new Promise(r => setTimeout(r, 35_000));
 
     diag.ssrsRequests = ssrsRequests;
     diag.pageUrl = page.url();
