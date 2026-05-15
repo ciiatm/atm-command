@@ -558,15 +558,23 @@ export async function debugScrapeTerminal(
       };
     });
 
-    // Wait up to 5s for SessionKeepAlive to fire (gives us the ControlID)
+    // Extract ControlID from the allRequests captured during page.goto()
+    // (SessionKeepAlive fires at ~745ms during page load, before goto() resolves)
     let controlId: string | null = null;
-    const ctrlListener = (r: import("puppeteer").HTTPResponse) => {
-      const m = r.url().match(/[?&]ControlID=([a-f0-9]+)/i);
-      if (m) controlId = m[1];
-    };
-    page.on("response", ctrlListener);
-    await sleep(5_000);
-    page.off("response", ctrlListener);
+    for (const req of allRequests) {
+      const m = req.url.match(/[?&]ControlID=([a-f0-9]+)/i);
+      if (m) { controlId = m[1]; break; }
+    }
+    // If not yet fired, wait up to 5s more
+    if (!controlId) {
+      const ctrlListener = (r: HTTPResponse) => {
+        const m = r.url().match(/[?&]ControlID=([a-f0-9]+)/i);
+        if (m) controlId = m[1];
+      };
+      page.on("response", ctrlListener);
+      await sleep(5_000);
+      page.off("response", ctrlListener);
+    }
     diag.controlId = controlId;
 
     // ── Test 1: UpdatePanel POST (no panel refresh expected — for info) ────
