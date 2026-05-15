@@ -773,45 +773,64 @@ export async function debugScrapeTerminal(
       }
     }
 
-    // ── Explore portal main page to find report URLs ─────────────────────
-    // Navigate to the portal home to find where transaction links actually live
-    const mainPortalUrl = "https://www.columbusdata.net/cdswebtool/";
-    await page.goto(mainPortalUrl, { waitUntil: "load" });
-    diag.mainPortal = {
+    // ── Test report.aspx (the CORRECT portal URL format for SSRS reports) ──
+    // Portal uses /includes/report.aspx?rptname=xxx, NOT /includes/ReportViewer.aspx
+    const end   = new Date();
+    const start = new Date();
+    start.setDate(start.getDate() - 60);
+    const reportAspxUrl =
+      `https://www.columbusdata.net/cdswebtool/includes/report.aspx?rptname=${REPORT_NAME}` +
+      `&TermID=${encodeURIComponent(termId)}` +
+      `&StartDate=${encodeURIComponent(formatDate(start))}` +
+      `&EndDate=${encodeURIComponent(formatDate(end))}`;
+    diag.reportAspxUrl = reportAspxUrl;
+    await page.goto(reportAspxUrl, { waitUntil: "load" });
+    await sleep(3_000);
+    diag.reportAspx = {
       url: page.url(),
       title: await page.title(),
-      links: await page.evaluate(() =>
-        Array.from(document.querySelectorAll("a[href]"))
-          .map(a => ({ text: (a.textContent ?? "").trim().substring(0, 60), href: (a as HTMLAnchorElement).href }))
-          .filter(l => l.text && l.href && !l.href.startsWith("javascript:"))
-          .slice(0, 40)
+      bodySnippet: (await page.content()).substring(0, 3000),
+      domTables: await page.evaluate(() =>
+        Array.from(document.querySelectorAll("table")).map(t => ({
+          id: t.id, rows: t.rows.length, text: (t.textContent ?? "").substring(0, 300),
+        }))
       ).catch(() => []),
-      bodySnippet: (await page.content()).substring(0, 2000),
+      frames: page.frames().map(f => ({ url: f.url(), name: f.name() })),
     };
 
-    // ── Check cdsatm.com for SSRS Report Server ───────────────────────────
-    // cdsatm.com might be the actual SSRS Report Server
-    try {
-      const cdsCookies = await page.cookies("https://www.cdsatm.com");
-      const colCookieStr = (await page.cookies("https://www.columbusdata.net")).map(c => `${c.name}=${c.value}`).join("; ");
-      const cdsTests = [
-        "https://www.cdsatm.com/",
-        "https://www.cdsatm.com/ReportServer/",
-        "https://www.cdsatm.com/cdswebtool/",
-        "https://www.cdsatm.com/Reports/",
-      ];
-      const cdsResults: Record<string, unknown>[] = [];
-      for (const url of cdsTests) {
-        try {
-          const r = await fetch(url, { headers: { "User-Agent": CHROME_UA, "Accept": "text/html,*/*;q=0.8", "Cookie": colCookieStr }, redirect: "manual" });
-          const body = r.status === 200 ? (await r.text()).substring(0, 300) : "";
-          cdsResults.push({ url, status: r.status, location: r.headers.get("location") ?? "", body });
-        } catch (e: any) { cdsResults.push({ url, error: String(e?.message ?? e) }); }
-      }
-      diag.cdsatmTests = cdsResults;
-    } catch (e: any) { diag.cdsatmError = String(e?.message ?? e); }
+    // ── Test journal.aspx (Real-time Transactions → Online Journals) ──────
+    const journalUrl = `https://www.columbusdata.net/cdswebtool/TerminalMonitoring/journal.aspx?TermID=${encodeURIComponent(termId)}&StartDate=${encodeURIComponent(formatDate(start))}&EndDate=${encodeURIComponent(formatDate(end))}`;
+    diag.journalUrl = journalUrl;
+    await page.goto(journalUrl, { waitUntil: "load" });
+    await sleep(2_000);
+    diag.journal = {
+      url: page.url(),
+      title: await page.title(),
+      bodySnippet: (await page.content()).substring(0, 3000),
+      domTables: await page.evaluate(() =>
+        Array.from(document.querySelectorAll("table")).map(t => ({
+          id: t.id, rows: t.rows.length, text: (t.textContent ?? "").substring(0, 400),
+        }))
+      ).catch(() => []),
+    };
 
-    // Re-navigate back to report URL for remaining tests
+    // ── Test TerminalActivitySummary (Quick View) ─────────────────────────
+    const actUrl = `https://www.columbusdata.net/cdswebtool/QuickView/TerminalActivitySummary.aspx?TermID=${encodeURIComponent(termId)}&StartDate=${encodeURIComponent(formatDate(start))}&EndDate=${encodeURIComponent(formatDate(end))}`;
+    diag.actUrl = actUrl;
+    await page.goto(actUrl, { waitUntil: "load" });
+    await sleep(2_000);
+    diag.actSummary = {
+      url: page.url(),
+      title: await page.title(),
+      bodySnippet: (await page.content()).substring(0, 3000),
+      domTables: await page.evaluate(() =>
+        Array.from(document.querySelectorAll("table")).map(t => ({
+          id: t.id, rows: t.rows.length, text: (t.textContent ?? "").substring(0, 400),
+        }))
+      ).catch(() => []),
+    };
+
+    // Re-navigate back to report URL for remaining SSRS tests
     await page.goto(diag.url as string, { waitUntil: "load" });
     await sleep(2_000);
 
