@@ -16,7 +16,7 @@ import {
   SyncPortalParams,
 } from "@workspace/api-zod";
 import { scrapeColumbusData } from "../lib/scrapers/columbus-data.js";
-import { scrapeColumbusTransactions } from "../lib/scrapers/columbus-data-transactions.js";
+import { scrapeColumbusTransactions, debugScrapeTerminal } from "../lib/scrapers/columbus-data-transactions.js";
 
 const PORTAL_CONFIG: Record<
   string,
@@ -219,11 +219,10 @@ router.post("/portals/:id/debug-tx", async (req, res) => {
   if (!portal) { res.status(404).json({ error: "Portal not found" }); return; }
 
   try {
-    const txMap = await scrapeColumbusTransactions(portal.username, portal.passwordEncrypted, [terminalId]);
-    const records = txMap.get(terminalId) ?? [];
-    res.json({ terminalId, count: records.length, sample: records.slice(0, 5), allRecords: records });
+    const diag = await debugScrapeTerminal(portal.username, portal.passwordEncrypted, terminalId);
+    res.json(diag);
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    res.status(500).json({ error: (err as Error).message, stack: (err as Error).stack });
   }
 });
 

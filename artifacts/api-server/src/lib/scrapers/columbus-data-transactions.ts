@@ -54,6 +54,112 @@ function formatDate(d: Date): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Debug: run one terminal and return raw diagnostics
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function debugScrapeTerminal(
+  username: string,
+  password: string,
+  termId: string,
+): Promise<Record<string, unknown>> {
+  const diag: Record<string, unknown> = {};
+
+  // Login
+  const cookieStr = await loginAndGetCookie(username, password);
+  diag.loginOk = !!cookieStr;
+  diag.cookieNames = cookieStr ? cookieStr.split(";").map(c => c.trim().split("=")[0]) : [];
+  if (!cookieStr) return diag;
+
+  // GET report page
+  const endDate = new Date();
+  const startDate = new Date();
+  startDate.setDate(startDate.getDate() - 60);
+  const start = formatDate(startDate);
+  const end = formatDate(endDate);
+
+  const reportUrl =
+    `${REPORT_BASE}?reportname=${REPORT_NAME}` +
+    `&TermID=${encodeURIComponent(termId)}` +
+    `&StartDate=${encodeURIComponent(start)}` +
+    `&EndDate=${encodeURIComponent(end)}`;
+  diag.reportUrl = reportUrl;
+
+  const baseHeaders = {
+    "Cookie": cookieStr,
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+  };
+
+  const getResp = await fetchWithTimeout(reportUrl, { method: "GET", headers: baseHeaders }, 30_000);
+  const pageHtml = await getResp.text();
+  diag.getStatus = getResp.status;
+  diag.getBodyLen = pageHtml.length;
+  diag.isLoginPage = /UsernameTextbox/i.test(pageHtml);
+  diag.pageTitle = (pageHtml.match(/<title[^>]*>(.*?)<\/title>/i) ?? [])[1] ?? null;
+  diag.hasViewState = pageHtml.includes("__VIEWSTATE");
+  diag.bodySnippet = pageHtml.substring(0, 500);
+
+  const viewState = extractInputValue(pageHtml, "__VIEWSTATE");
+  const viewStateGenerator = extractInputValue(pageHtml, "__VIEWSTATEGENERATOR");
+  const eventValidation = extractInputValue(pageHtml, "__EVENTVALIDATION");
+  const controlId = extractControlId(pageHtml);
+  diag.viewStateLen = viewState?.length ?? 0;
+  diag.controlId = controlId;
+
+  if (!viewState) return diag;
+
+  // POST UpdatePanel
+  const formData = new URLSearchParams();
+  formData.set("ScriptManager1", "ScriptManager1|ReportViewer1$ctl03");
+  formData.set("__EVENTTARGET", "ReportViewer1$ctl03");
+  formData.set("__EVENTARGUMENT", "");
+  formData.set("__VIEWSTATE", viewState);
+  formData.set("__VIEWSTATEGENERATOR", viewStateGenerator ?? "");
+  formData.set("__EVENTVALIDATION", eventValidation ?? "");
+  formData.set("ReportViewer1$ctl03$ctl00", termId);
+  formData.set("ReportViewer1$ctl03$ctl01", start);
+  formData.set("ReportViewer1$ctl10", "");
+  formData.set("ReportViewer1$ctl11", "quirks");
+  formData.set("ReportViewer1$AsyncWait$HiddenCancelField", "False");
+  formData.set("ReportViewer1$ToggleParam$store", "");
+  formData.set("ReportViewer1$ToggleParam$collapse", "false");
+  formData.set("ReportViewer1$ctl08$ClientClickedId", "");
+  formData.set("ReportViewer1$ctl07$store", "");
+  formData.set("ReportViewer1$ctl07$collapse", "true");
+  formData.set("ReportViewer1$ctl09$ScrollPosition", "");
+  formData.set("ReportViewer1$ctl09$ReportControl$ctl04", "100");
+  formData.set("txtHideNotice", "False");
+
+  const postResp = await fetchWithTimeout(
+    `${REPORT_BASE}?reportname=${REPORT_NAME}`,
+    {
+      method: "POST",
+      headers: {
+        ...baseHeaders,
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "X-Requested-With": "XMLHttpRequest",
+        "X-MicrosoftAjax": "Delta=true",
+        "Referer": reportUrl,
+      },
+      body: formData.toString(),
+    },
+    30_000,
+  );
+
+  const postBody = await postResp.text();
+  diag.postStatus = postResp.status;
+  diag.postBodyLen = postBody.length;
+  diag.postSnippet = postBody.substring(0, 800);
+  diag.postControlId = extractControlId(postBody);
+  diag.tableCount = (postBody.match(/<table/gi) ?? []).length;
+  diag.hasTran = /tran/i.test(postBody);
+  diag.hasAmt = /amt/i.test(postBody);
+
+  return diag;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Public entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
