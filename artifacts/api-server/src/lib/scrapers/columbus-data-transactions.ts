@@ -773,6 +773,48 @@ export async function debugScrapeTerminal(
       }
     }
 
+    // ── Explore portal main page to find report URLs ─────────────────────
+    // Navigate to the portal home to find where transaction links actually live
+    const mainPortalUrl = "https://www.columbusdata.net/cdswebtool/";
+    await page.goto(mainPortalUrl, { waitUntil: "load" });
+    diag.mainPortal = {
+      url: page.url(),
+      title: await page.title(),
+      links: await page.evaluate(() =>
+        Array.from(document.querySelectorAll("a[href]"))
+          .map(a => ({ text: (a.textContent ?? "").trim().substring(0, 60), href: (a as HTMLAnchorElement).href }))
+          .filter(l => l.text && l.href && !l.href.startsWith("javascript:"))
+          .slice(0, 40)
+      ).catch(() => []),
+      bodySnippet: (await page.content()).substring(0, 2000),
+    };
+
+    // ── Check cdsatm.com for SSRS Report Server ───────────────────────────
+    // cdsatm.com might be the actual SSRS Report Server
+    try {
+      const cdsCookies = await page.cookies("https://www.cdsatm.com");
+      const colCookieStr = (await page.cookies("https://www.columbusdata.net")).map(c => `${c.name}=${c.value}`).join("; ");
+      const cdsTests = [
+        "https://www.cdsatm.com/",
+        "https://www.cdsatm.com/ReportServer/",
+        "https://www.cdsatm.com/cdswebtool/",
+        "https://www.cdsatm.com/Reports/",
+      ];
+      const cdsResults: Record<string, unknown>[] = [];
+      for (const url of cdsTests) {
+        try {
+          const r = await fetch(url, { headers: { "User-Agent": CHROME_UA, "Accept": "text/html,*/*;q=0.8", "Cookie": colCookieStr }, redirect: "manual" });
+          const body = r.status === 200 ? (await r.text()).substring(0, 300) : "";
+          cdsResults.push({ url, status: r.status, location: r.headers.get("location") ?? "", body });
+        } catch (e: any) { cdsResults.push({ url, error: String(e?.message ?? e) }); }
+      }
+      diag.cdsatmTests = cdsResults;
+    } catch (e: any) { diag.cdsatmError = String(e?.message ?? e); }
+
+    // Re-navigate back to report URL for remaining tests
+    await page.goto(diag.url as string, { waitUntil: "load" });
+    await sleep(2_000);
+
     // Test A: $ctl09$ReportControl$ctl00 with Navigate1 (report control postback — what SSRS JS actually calls)
     diag.postResult_reportCtl_Navigate1 = await testPostbackExt("ReportViewer1$ctl09$ReportControl$ctl00", "Navigate1");
 
