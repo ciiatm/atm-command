@@ -9,14 +9,16 @@
  * 4. Merge and return
  */
 
-import puppeteer, { type Browser, type Page, type Frame } from "puppeteer";
+import puppeteer, { type Browser, type Page, type Frame, type HTTPResponse } from "puppeteer";
 import { execSync } from "node:child_process";
 import { logger } from "../logger.js";
 
-const LOGIN_URL        = "https://www.columbusdata.net/cdswebtool/login/login.aspx";
-const GRID_URL         = "https://www.columbusdata.net/cdswebtool/QuickView/TerminalStatusReport.aspx";
-const TERM_LIST_URL    = "https://www.columbusdata.net/cdswebtool/includes/ReportViewer.aspx?reportname=rptTerminalListType";
-const ACTIVE_TERMS_URL = "https://www.columbusdata.net/cdswebtool/includes/ReportViewer.aspx?reportname=rptActiveTerminals";
+const LOGIN_URL         = "https://www.columbusdata.net/cdswebtool/login/login.aspx";
+const GRID_URL          = "https://www.columbusdata.net/cdswebtool/QuickView/TerminalStatusReport.aspx";
+const TERM_LIST_URL     = "https://www.columbusdata.net/cdswebtool/includes/ReportViewer.aspx?reportname=rptTerminalListType";
+const ACTIVE_TERMS_URL  = "https://www.columbusdata.net/cdswebtool/includes/ReportViewer.aspx?reportname=rptActiveTerminals";
+const SSRS_HANDLER_BASE = "https://www.columbusdata.net/cdswebtool/Reserved.ReportViewerWebControl.axd";
+const SSRS_VERSION      = "12.0.2402.15";
 
 // ---------------------------------------------------------------------------
 // Public interface
@@ -191,65 +193,191 @@ async function scrapeReportViewer(
 ): Promise<Map<string, InfoRow>> {
   logger.info({ url, reportName }, "Columbus Data: loading report");
 
-  await page.goto(url, { waitUntil: "domcontentloaded" }).catch(() => {});
+  // Capture SSRS ControlID from any response URL (used for CSV export fallback)
+  let controlId: string | null = null;
+  const onResponse = (r: HTTPResponse) => {
+    const m = r.url().match(/[?&]ControlID=([a-f0-9]+)/i);
+    if (m) controlId = m[1];
+  };
+  page.on("response", onResponse);
 
-  // Give the page time to start rendering
-  await new Promise(r => setTimeout(r, 2_000));
+  try {
+    // Hard navigate — do NOT swallow errors
+    await page.goto(url, { waitUntil: "domcontentloaded" });
 
-  // Click any "View Report" / "Submit" / "Run" button
-  const clicked = await page.evaluate(() => {
-    const btn = Array.from(
-      document.querySelectorAll<HTMLElement>("input[type=submit], input[type=button], button")
-    ).find(el => /view|submit|run|generate|report/i.test(
-      (el as HTMLInputElement).value || (el as HTMLButtonElement).textContent || ""
-    ));
-    if (btn) { btn.click(); return (btn as HTMLInputElement).value || (btn as HTMLButtonElement).textContent || "clicked"; }
-    return null;
-  }).catch(() => null);
-
-  if (clicked) {
-    logger.info({ reportName, clicked }, "Columbus Data: clicked submit button");
+    // Give the page + SSRS JS time to initialise (KeepAlive POST fires → gives ControlID)
     await new Promise(r => setTimeout(r, 3_000));
-  }
 
-  // Poll all frames (main + iframes) for up to 30 s
-  const deadline = Date.now() + 30_000;
-  let bestRows: InfoRow[] = [];
+    // Trigger the report.  SSRS ReportViewer v12 uses UpdatePanel postback;
+    // the "View Report" button target is ReportViewer1$ctl03.
+    const triggered = await page.evaluate(() => {
+      // Primary: UpdatePanel async postback (confirmed via DevTools investigation)
+      if (typeof (window as any).__doPostBack === "function") {
+        try { (window as any).__doPostBack("ReportViewer1$ctl03", ""); return "postback"; } catch {}
+      }
+      // Fallback: click any image/submit button (ctl07_img etc.)
+      const btn = Array.from(
+        document.querySelectorAll<HTMLElement>(
+          "input[type=submit], input[type=image], input[type=button], button"
+        )
+      ).find(el => {
+        const v = (el as HTMLInputElement).value || (el as HTMLButtonElement).textContent || el.getAttribute("title") || el.id || "";
+        return /view|submit|run|generate|report|ctl07/i.test(v) || (el as HTMLInputElement).type === "image";
+      });
+      if (btn) { btn.click(); return "button-click"; }
+      return "none";
+    }).catch(() => "error");
 
-  while (Date.now() < deadline) {
-    const allFrames: Frame[] = [page.mainFrame(), ...page.frames().filter(f => f !== page.mainFrame())];
+    logger.info({ reportName, triggered }, "Columbus Data: report trigger");
+    await new Promise(r => setTimeout(r, 4_000));
 
-    logger.info({ reportName, frameCount: allFrames.length }, "Columbus Data: scanning frames");
-
-    for (const frame of allFrames) {
-      let frameUrl = "";
-      try { frameUrl = frame.url(); } catch { continue; }
-
-      const rows = await extractTableFromFrame(frame, reportName, frameUrl).catch(() => null);
-
-      if (rows && rows.length > 0) {
-        logger.info({ reportName, frameUrl, rowCount: rows.length, sample: rows[0] }, "Columbus Data: found report rows");
-        if (rows.length > bestRows.length) bestRows = rows;
+    // ── Try CSV export first (cleanest path) ────────────────────────────────
+    if (controlId) {
+      const csvRows = await tryInfoCSVExport(page, controlId, reportName);
+      if (csvRows && csvRows.length > 0) {
+        logger.info({ reportName, count: csvRows.length, method: "csv" }, "Columbus Data: got info rows via CSV");
+        const map = new Map<string, InfoRow>();
+        for (const row of csvRows) { if (row.terminalId) map.set(row.terminalId, row); }
+        return map;
       }
     }
 
-    if (bestRows.length > 0) break;
+    // ── Fall back: poll all frames (main + iframes) for up to 30 s ──────────
+    const deadline = Date.now() + 30_000;
+    let bestRows: InfoRow[] = [];
 
-    // Not found yet — wait and retry
-    await new Promise(r => setTimeout(r, 3_000));
-  }
+    while (Date.now() < deadline) {
+      const allFrames: Frame[] = [page.mainFrame(), ...page.frames().filter(f => f !== page.mainFrame())];
 
-  if (bestRows.length === 0) {
-    // Log a diagnostic snippet from the main frame
-    const snippet = await page.evaluate(() => document.body?.innerText?.slice(0, 500) ?? "").catch(() => "");
-    logger.warn({ reportName, bodySnippet: snippet }, "Columbus Data: no rows found in any frame after 30s");
-  }
+      logger.info({ reportName, frameCount: allFrames.length }, "Columbus Data: scanning frames");
 
-  const map = new Map<string, InfoRow>();
-  for (const row of bestRows) {
-    if (row.terminalId) map.set(row.terminalId, row);
+      for (const frame of allFrames) {
+        let frameUrl = "";
+        try { frameUrl = frame.url(); } catch { continue; }
+
+        const rows = await extractTableFromFrame(frame, reportName, frameUrl).catch(() => null);
+
+        if (rows && rows.length > 0) {
+          logger.info({ reportName, frameUrl, rowCount: rows.length, sample: rows[0] }, "Columbus Data: found report rows");
+          if (rows.length > bestRows.length) bestRows = rows;
+        }
+      }
+
+      if (bestRows.length > 0) break;
+      await new Promise(r => setTimeout(r, 3_000));
+    }
+
+    if (bestRows.length === 0) {
+      const snippet = await page.evaluate(() => document.body?.innerText?.slice(0, 500) ?? "").catch(() => "");
+      logger.warn({ reportName, bodySnippet: snippet }, "Columbus Data: no rows found in any frame after 30s");
+    }
+
+    const map = new Map<string, InfoRow>();
+    for (const row of bestRows) { if (row.terminalId) map.set(row.terminalId, row); }
+    return map;
+
+  } finally {
+    page.off("response", onResponse);
   }
-  return map;
+}
+
+// ---------------------------------------------------------------------------
+// CSV export for the info report (terminal list)
+// ---------------------------------------------------------------------------
+
+async function tryInfoCSVExport(
+  page: Page,
+  controlId: string,
+  reportName: string,
+): Promise<InfoRow[] | null> {
+  try {
+    const exportUrl =
+      `${SSRS_HANDLER_BASE}` +
+      `?OpType=Export` +
+      `&Version=${encodeURIComponent(SSRS_VERSION)}` +
+      `&ControlID=${controlId}` +
+      `&Culture=en-US` +
+      `&UICulture=en-US` +
+      `&ReportStack=1` +
+      `&ExportFormat=CSV`;
+
+    logger.debug({ reportName, exportUrl }, "Columbus Data: trying CSV export for info");
+    const response = await page.goto(exportUrl, { waitUntil: "domcontentloaded" });
+    if (!response || !response.ok()) {
+      logger.debug({ reportName, status: response?.status() }, "Columbus Data: CSV info export failed");
+      return null;
+    }
+
+    const csvText = await response.text();
+    if (!csvText || csvText.trim().length < 20) return null;
+
+    return parseInfoCSV(csvText);
+  } catch (err) {
+    logger.debug({ reportName, err: (err as Error).message }, "Columbus Data: CSV info export error");
+    return null;
+  }
+}
+
+function parseInfoCSV(csv: string): InfoRow[] {
+  const lines = csv.split(/\r?\n/).filter(l => l.trim().length > 0);
+  if (lines.length < 2) return [];
+
+  const parseRow = (line: string): string[] => {
+    const result: string[] = [];
+    let cur = "";
+    let inQuote = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') {
+        if (inQuote && line[i + 1] === '"') { cur += '"'; i++; }
+        else { inQuote = !inQuote; }
+      } else if (ch === "," && !inQuote) {
+        result.push(cur.trim()); cur = "";
+      } else { cur += ch; }
+    }
+    result.push(cur.trim());
+    return result;
+  };
+
+  const headers = parseRow(lines[0]).map(h => h.toLowerCase().replace(/\s+/g, ""));
+  const col = (kw: string) => headers.findIndex(h => h.includes(kw.replace(/\s+/g, "")));
+
+  const iTermId   = col("terminalid") >= 0 ? col("terminalid") : col("termid") >= 0 ? col("termid") : 0;
+  const iLocation = col("locationname") >= 0 ? col("locationname") : col("location") >= 0 ? col("location") : -1;
+  const iAddress  = col("address");
+  const iCity     = col("city");
+  const iState    = col("state") >= 0 ? col("state") : col("province");
+  const iPostal   = col("postal") >= 0 ? col("postal") : col("zip");
+  const iProp     = col("propertytype") >= 0 ? col("propertytype") : col("property") >= 0 ? col("property") : -1;
+  const iMake     = col("machinetype") >= 0 ? col("machinetype") : col("makemodel") >= 0 ? col("makemodel") : col("make") >= 0 ? col("make") : -1;
+  const iSurch    = col("surcharge") >= 0 ? col("surcharge") : col("fee") >= 0 ? col("fee") : -1;
+
+  const parseDollar = (s: string): number | null => {
+    const n = parseFloat(s.replace(/[$,\s]/g, ""));
+    return isNaN(n) ? null : n;
+  };
+
+  const result: InfoRow[] = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cells = parseRow(lines[i]);
+    if (cells.length < 2) continue;
+    const terminalId = cells[iTermId]?.trim() ?? "";
+    if (!terminalId || /^total|^grand|^sub/i.test(terminalId) || terminalId.length > 20) continue;
+
+    const g = (idx: number) => (idx >= 0 && cells[idx] ? cells[idx].trim() || null : null);
+    result.push({
+      terminalId,
+      locationName: g(iLocation),
+      address:      g(iAddress),
+      city:         g(iCity),
+      state:        g(iState),
+      postalCode:   g(iPostal),
+      propertyType: g(iProp),
+      makeModel:    g(iMake),
+      surcharge:    iSurch >= 0 ? parseDollar(cells[iSurch] ?? "") : null,
+    });
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------

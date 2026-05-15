@@ -206,6 +206,27 @@ router.post("/portals/:id/sync-transactions", async (req, res) => {
   runTransactionSyncInBackground(portal);
 });
 
+// Debug endpoint: scrape a single terminal and return raw results
+// POST /portals/:id/debug-tx { terminalId: "L443079" }
+router.post("/portals/:id/debug-tx", async (req, res) => {
+  const params = SyncPortalParams.safeParse({ id: Number(req.params.id) });
+  if (!params.success) { res.status(400).json({ error: "Invalid id" }); return; }
+
+  const terminalId = req.body?.terminalId as string | undefined;
+  if (!terminalId) { res.status(400).json({ error: "terminalId required in body" }); return; }
+
+  const [portal] = await db.select().from(portalsTable).where(eq(portalsTable.id, params.data.id));
+  if (!portal) { res.status(404).json({ error: "Portal not found" }); return; }
+
+  try {
+    const txMap = await scrapeColumbusTransactions(portal.username, portal.passwordEncrypted, [terminalId]);
+    const records = txMap.get(terminalId) ?? [];
+    res.json({ terminalId, count: records.length, sample: records.slice(0, 5), allRecords: records });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
 async function runSyncInBackground(portal: {
   id: number; name: string; username: string; passwordEncrypted: string; syncIntervalHours: number;
 }) {
