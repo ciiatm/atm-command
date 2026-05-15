@@ -577,77 +577,85 @@ export async function debugScrapeTerminal(
     }
     diag.controlId = controlId;
 
-    // ── Test 1: UpdatePanel POST (no panel refresh expected — for info) ────
-    const postResult = await page.evaluate(async (postbackTarget: string): Promise<string> => {
-      try {
-        const form = document.querySelector<HTMLFormElement>("#form1, form");
-        if (!form) return "ERR:no-form";
-        const params = new URLSearchParams();
-        form.querySelectorAll<HTMLInputElement>("input, select, textarea").forEach(el => {
-          if (el.name && el.type !== "submit" && el.type !== "image" && el.type !== "button") {
-            params.append(el.name, el.value ?? "");
-          }
-        });
-        params.set("__EVENTTARGET", postbackTarget);
-        params.set("__EVENTARGUMENT", "");
-        const sm = (window as any).Sys?.WebForms?.PageRequestManager?.getInstance?.();
-        const smId: string = sm?._scriptManagerID ?? "ScriptManager1";
-        params.set(smId, `${smId}|${postbackTarget}`);
-        const resp = await fetch(form.action, {
-          method: "POST", credentials: "include",
-          headers: { "Content-Type": "application/x-www-form-urlencoded; charset=utf-8", "X-MicrosoftAjax": "Delta=true", "X-Requested-With": "XMLHttpRequest" },
-          body: params.toString(),
-        });
-        const text = await resp.text();
-        const sections: string[] = [];
-        let pos = 0;
-        while (pos < text.length && sections.length < 20) {
-          const p1 = text.indexOf("|", pos); if (p1 < 0) break;
-          const len = parseInt(text.substring(pos, p1), 10); if (isNaN(len)) break;
-          const p2 = text.indexOf("|", p1 + 1); if (p2 < 0) break;
-          const type = text.substring(p1 + 1, p2);
-          const p3 = text.indexOf("|", p2 + 1); if (p3 < 0) break;
-          const id = text.substring(p2 + 1, p3);
-          const contentStart = p3 + 1;
-          if (contentStart + len > text.length) break;
-          const content = text.substring(contentStart, contentStart + len);
-          sections.push(`${type}/${id}(${len})`);
-          if (type === "updatePanel") sections.push(`PANEL:${content.substring(0, 300)}`);
-          pos = contentStart + len + 1;
-        }
-        return `STATUS:${resp.status} LEN:${text.length} SECTIONS:${JSON.stringify(sections)}`;
-      } catch (e: any) { return `ERR:${e?.message ?? "unknown"}`; }
-    }, "ReportViewer1$ctl03$ctl00").catch(() => "ERR:evaluate-threw");
-    diag.postResult = postResult;
-
-    // ── Test 2: OpType=Export CSV via in-page fetch ───────────────────────
-    if (controlId) {
-      const exportResult = await page.evaluate(async (ctrl: string, ver: string): Promise<string> => {
-        try {
-          const exportUrl = `/cdswebtool/Reserved.ReportViewerWebControl.axd?OpType=Export&Version=${encodeURIComponent(ver)}&ControlID=${ctrl}&Culture=en-US&UICulture=en-US&ReportStack=1&ExportFormat=CSV`;
-          const resp = await fetch(exportUrl, { credentials: "include" });
+    // ── Helper: fire UpdatePanel POST and return section list ─────────────
+    async function testPostback(target: string): Promise<string> {
+      return page.evaluate(async (t: string): Promise<string> => {
+        const doPost = async (target: string) => {
+          const form = document.querySelector<HTMLFormElement>("#form1, form");
+          if (!form) return "ERR:no-form";
+          const params = new URLSearchParams();
+          form.querySelectorAll<HTMLInputElement>("input, select, textarea").forEach(el => {
+            if (el.name && el.type !== "submit" && el.type !== "image" && el.type !== "button")
+              params.append(el.name, el.value ?? "");
+          });
+          params.set("__EVENTTARGET", target);
+          params.set("__EVENTARGUMENT", "");
+          const sm = (window as any).Sys?.WebForms?.PageRequestManager?.getInstance?.();
+          const smId: string = sm?._scriptManagerID ?? "ScriptManager1";
+          params.set(smId, `${smId}|${target}`);
+          const resp = await fetch(form.action, {
+            method: "POST", credentials: "include",
+            headers: { "Content-Type": "application/x-www-form-urlencoded; charset=utf-8", "X-MicrosoftAjax": "Delta=true", "X-Requested-With": "XMLHttpRequest" },
+            body: params.toString(),
+          });
           const text = await resp.text();
-          return `STATUS:${resp.status} REDIRECTED:${resp.redirected} URL:${resp.url} LEN:${text.length} SNIPPET:${text.substring(0, 600)}`;
-        } catch (e: any) { return `ERR:${e?.message}`; }
-      }, controlId, SSRS_VERSION).catch(() => "ERR:evaluate-threw");
-      diag.exportResult = exportResult;
-    } else {
-      diag.exportResult = "SKIPPED:no-controlId";
+          const sections: string[] = [];
+          let pos = 0;
+          while (pos < text.length && sections.length < 25) {
+            const p1 = text.indexOf("|", pos); if (p1 < 0) break;
+            const len = parseInt(text.substring(pos, p1), 10); if (isNaN(len)) break;
+            const p2 = text.indexOf("|", p1 + 1); if (p2 < 0) break;
+            const type = text.substring(p1 + 1, p2);
+            const p3 = text.indexOf("|", p2 + 1); if (p3 < 0) break;
+            const contentStart = p3 + 1;
+            if (contentStart + len > text.length) break;
+            const content = text.substring(contentStart, contentStart + len);
+            sections.push(`${type}(${len})`);
+            if (type === "updatePanel") sections.push(`PANEL_HTML:${content.substring(0, 300)}`);
+            if (type === "panelsToRefreshIDs" || type === "updatePanelIDs" || type === "postBackControlIDs") sections.push(`CONTENT:${content}`);
+            if (type === "error") sections.push(`ERROR:${content}`);
+            pos = contentStart + len + 1;
+          }
+          return `STATUS:${resp.status} LEN:${text.length} SECTS:${JSON.stringify(sections)}`;
+        };
+        return doPost(t);
+      }, target).catch((e: any) => `ERR:${(e as Error).message}`);
     }
 
-    // ── Test 3: OpType=ReportPage via in-page fetch ───────────────────────
-    if (controlId) {
-      const reportPageResult = await page.evaluate(async (ctrl: string, ver: string): Promise<string> => {
+    // ── Helper: OpType=Export CSV ─────────────────────────────────────────
+    async function testExport(ctrl: string): Promise<string> {
+      return page.evaluate(async (c: string, v: string): Promise<string> => {
         try {
-          const url = `/cdswebtool/Reserved.ReportViewerWebControl.axd?OpType=ReportPage&Version=${encodeURIComponent(ver)}&ControlID=${ctrl}&Culture=en-US&UICulture=en-US&ReportStack=1&PageNumber=1&Format=HTML4.0&DeviceInfo=%3CDeviceInfo%3E%3CBackColor%3E%23FFFFFF%3C%2FBackColor%3E%3C%2FDeviceInfo%3E`;
-          const resp = await fetch(url, { credentials: "include" });
+          const exportUrl = `/cdswebtool/Reserved.ReportViewerWebControl.axd?OpType=Export&Version=${encodeURIComponent(v)}&ControlID=${c}&Culture=en-US&UICulture=en-US&ReportStack=1&ExportFormat=CSV`;
+          const resp = await fetch(exportUrl, { credentials: "include" });
           const text = await resp.text();
-          return `STATUS:${resp.status} REDIRECTED:${resp.redirected} URL:${resp.url} LEN:${text.length} SNIPPET:${text.substring(0, 600)}`;
+          return `STATUS:${resp.status} REDIRECTED:${resp.redirected} LEN:${text.length} SNIPPET:${text.substring(0, 500)}`;
         } catch (e: any) { return `ERR:${e?.message}`; }
-      }, controlId, SSRS_VERSION).catch(() => "ERR:evaluate-threw");
-      diag.reportPageResult = reportPageResult;
-    } else {
-      diag.reportPageResult = "SKIPPED:no-controlId";
+      }, ctrl, SSRS_VERSION).catch(() => "ERR:evaluate-threw");
+    }
+
+    // Get all form field names (SSRS-specific fields beyond standard ASP.NET)
+    diag.formFields = await page.evaluate(() =>
+      Array.from(document.querySelectorAll<HTMLInputElement>("#form1 input, #form1 select, #form1 textarea, form input, form select"))
+        .filter(el => el.name && el.type !== "submit" && el.type !== "image")
+        .map(el => `${el.name}=${el.value?.substring(0, 30) ?? ""}`)
+    ).catch(() => []);
+
+    // Test 1a: postback with $ctl03$ctl00 (View Report button)
+    diag.postResult_ctl00 = await testPostback("ReportViewer1$ctl03$ctl00");
+
+    // Test 1b: postback with $ctl03 (parameter area — what Chrome DevTools showed)
+    diag.postResult_ctl03 = await testPostback("ReportViewer1$ctl03");
+
+    // Export immediately after postback
+    if (controlId) {
+      diag.exportResult_immediate = await testExport(controlId);
+    }
+
+    // Wait 10s for async server-side render to complete, then try Export again
+    await sleep(10_000);
+    if (controlId) {
+      diag.exportResult_after10s = await testExport(controlId);
     }
 
     diag.pageUrl   = page.url();
