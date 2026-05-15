@@ -1,30 +1,24 @@
 /**
  * Columbus Data Transaction Scraper
  *
- * SSRS WebForms flow:
- *   1. Page loads with URL params → SSRS hides ParametersRow, auto-renders
- *   2. SSRS JS calls __doPostBack('ReportViewer1$ctl03$ctl00','') → UpdatePanel POST
- *   3. Server renders report → UpdatePanel response (or inline DOM update)
- *   4. SSRS JS may then request OpType=ReportPage for the actual HTML
+ * Uses the "Online Transaction Journals" page (journal.aspx) instead of the
+ * SSRS-based ReportViewer.aspx which is permanently blocked (302 → 404).
  *
  * Strategy:
  *   - ONE browser, ONE page, sequential terminals (avoids --single-process crashes)
- *   - After navigation: intercept ALL POST responses to ReportViewer.aspx
- *   - Also intercept OpType=ReportPage responses
- *   - If neither fires in 10s, explicitly call __doPostBack to force render
- *   - Wait up to 90s total
- *   - Parse UpdatePanel format OR raw HTML OR DOM table
+ *   - Navigate to journal.aspx for each terminal
+ *   - Select terminal via Telerik RadComboBox (LoadOnDemand: type → wait → click)
+ *   - Set date range via Telerik RadDatePicker set_selectedDate() JS API
+ *   - Submit with __EVENTTARGET=lnkView + Form1.submit() (avoids strict-mode error)
+ *   - Extract Table1 text content and parse into ColumbusTransactionRecord[]
  */
 
-import puppeteer, { type Browser, type Page, type HTTPResponse, type HTTPRequest } from "puppeteer";
+import puppeteer, { type Browser, type Page } from "puppeteer";
 import { execSync } from "node:child_process";
 import { logger } from "../logger.js";
 
 const LOGIN_URL    = "https://www.columbusdata.net/cdswebtool/login/login.aspx";
-const REPORT_BASE  = "https://www.columbusdata.net/cdswebtool/includes/ReportViewer.aspx";
-const REPORT_NAME  = "rptTransactionDetailByTIDWithBalance";
-const SSRS_HANDLER = "Reserved.ReportViewerWebControl.axd";
-const SSRS_VERSION = "12.0.2402.15";
+const JOURNAL_URL  = "https://www.columbusdata.net/cdswebtool/TerminalMonitoring/journal.aspx";
 
 // Real-browser user-agent (Chrome 124 on macOS)
 const CHROME_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
@@ -147,96 +141,144 @@ export async function scrapeColumbusTransactions(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Scrape one terminal
+// Scrape one terminal via journal.aspx (Online Transaction Journals)
 //
-// Strategy (with bot-detection bypass applied at browser level):
-//   1. Navigate to ReportViewer.aspx — SSRS JS now runs without bot redirect
-//   2. Wait up to 20s for SSRS JS to auto-render (networkidle2 / DOM polling)
-//   3. Extract from DOM if report tables exist
-//   4. Fallback: fire UpdatePanel POST manually and parse UpdatePanel response
-//   5. Fallback: OpType=Export CSV
+// The SSRS-based ReportViewer.aspx approach is permanently blocked (302 → 404).
+// journal.aspx is a standard ASP.NET WebForms page with Telerik controls that
+// returns per-transaction journal data without SSRS.
+//
+// Flow:
+//   1. Navigate to journal.aspx
+//   2. Type terminal ID into Telerik RadComboBox (triggers AJAX LoadOnDemand)
+//   3. Wait for .rcbItem dropdown items → click matching item + JS-select
+//   4. Set date range via Telerik RadDatePicker set_selectedDate() JS API
+//   5. Submit via __EVENTTARGET=lnkView + Form1.submit() (avoids strict-mode error)
+//   6. Extract Table1 text content → parseJournalText()
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function scrapeOneTerminal(
   page: Page,
   termId: string,
-  startStr: string,
-  endStr: string,
+  startStr: string,   // "MM/DD/YYYY"
+  endStr:   string,
 ): Promise<ColumbusTransactionRecord[]> {
-  const url =
-    `${REPORT_BASE}?reportname=${REPORT_NAME}` +
-    `&TermID=${encodeURIComponent(termId)}` +
-    `&StartDate=${encodeURIComponent(startStr)}` +
-    `&EndDate=${encodeURIComponent(endStr)}`;
+  logger.debug({ termId }, "Columbus Tx: navigating to journal.aspx");
+  await page.goto(JOURNAL_URL, { waitUntil: "load" });
 
-  logger.debug({ termId }, "Columbus Tx: navigating");
+  // Wait for Telerik JS to initialise ($find becomes available)
+  await page.waitForFunction(() => !!(window as any).$find, { timeout: 10_000 }).catch(() => null);
+  await sleep(500);
 
-  // Wait for network to settle — SSRS JS fires several requests during render
-  // (SessionKeepAlive, OpType=ReportPage, UpdatePanel POST, etc.)
-  await page.goto(url, { waitUntil: "load" });
+  // ── 1. Select terminal in RadComboBox (LoadOnDemand) ──────────────────────
+  const comboInput = await page.$("#cbsTerminals_radTerminalSelector_Input");
+  if (comboInput) {
+    // Clear the input and type the terminal ID to trigger AJAX item load
+    await page.click("#cbsTerminals_radTerminalSelector_Input");
+    await page.evaluate(() => {
+      const el = document.getElementById("cbsTerminals_radTerminalSelector_Input") as HTMLInputElement;
+      if (el) { el.value = ""; el.select(); }
+    });
+    await page.type("#cbsTerminals_radTerminalSelector_Input", termId, { delay: 80 });
+  }
 
-  // Give SSRS JS time to render the report (SessionKeepAlive fires ~500ms,
-  // report render fires ~1-2s, rendering completes ~3-5s after page load)
-  // Poll DOM every 500ms for up to 15s
-  let domRows: ColumbusTransactionRecord[] = [];
-  for (let attempt = 0; attempt < 30; attempt++) {
-    await sleep(500);
-    domRows = await parseTableFromDom(page, termId);
-    if (domRows.length > 0) {
-      logger.debug({ termId, count: domRows.length, attempt }, "Columbus Tx: SSRS auto-rendered");
-      return domRows;
+  // Wait for Telerik dropdown DOM items to appear
+  await page.waitForSelector(".rcbItem", { timeout: 6_000 }).catch(() => null);
+  await sleep(400);
+
+  // Click the matching DOM item
+  const domClickResult = await page.evaluate((targetId: string) => {
+    const items = Array.from(document.querySelectorAll(".rcbItem, [class*='rcbItem']"));
+    const match = items.find(el => el.textContent?.includes(targetId));
+    if (match) { (match as HTMLElement).click(); return `clicked: ${match.textContent?.trim()}`; }
+    return "no .rcbItem matched";
+  }, termId).catch((e: Error) => String(e));
+
+  await sleep(300);
+
+  // Also use Telerik JS API as belt-and-suspenders
+  const jsSelectResult = await page.evaluate((targetId: string) => {
+    const w = window as any;
+    const combo = w.$find?.("cbsTerminals_radTerminalSelector");
+    if (!combo) return "combo not found";
+    const items = combo.get_items();
+    for (let i = 0; i < items.get_count(); i++) {
+      const item = items.getItem(i);
+      if (item.get_value() === targetId || item.get_text().includes(targetId)) {
+        item.select();
+        return `JS-selected[${i}]: ${item.get_text()}`;
+      }
     }
-  }
-
-  // SSRS didn't auto-render in 15s — fire UpdatePanel POST manually
-  logger.debug({ termId }, "Columbus Tx: DOM empty after 15s, firing manual UpdatePanel POST");
-
-  const payload = await page.evaluate(async (postbackTarget: string): Promise<string | null> => {
-    try {
-      const form = document.querySelector<HTMLFormElement>("#form1, form");
-      if (!form) return "ERR:no-form";
-      const params = new URLSearchParams();
-      form.querySelectorAll<HTMLInputElement>("input, select, textarea").forEach(el => {
-        if (el.name && el.type !== "submit" && el.type !== "image" && el.type !== "button") {
-          params.append(el.name, el.value ?? "");
-        }
+    // Fallback: craft ClientState directly so the server receives the value
+    const input      = document.getElementById("cbsTerminals_radTerminalSelector_Input")      as HTMLInputElement;
+    const stateInput = document.getElementById("cbsTerminals_radTerminalSelector_ClientState") as HTMLInputElement;
+    if (input && stateInput) {
+      input.value      = targetId;
+      stateInput.value = JSON.stringify({
+        logEntries:      [{ type: 5, index: 0, value: targetId, text: targetId }],
+        selectedIndices: [0],
       });
-      params.set("__EVENTTARGET", postbackTarget);
-      params.set("__EVENTARGUMENT", "");
-      const sm = (window as any).Sys?.WebForms?.PageRequestManager?.getInstance?.();
-      const smId: string = sm?._scriptManagerID ?? "ScriptManager1";
-      params.set(smId, `${smId}|${postbackTarget}`);
-      const resp = await fetch(form.action, {
-        method: "POST", credentials: "include",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
-          "X-MicrosoftAjax": "Delta=true",
-          "X-Requested-With": "XMLHttpRequest",
-        },
-        body: params.toString(),
-      });
-      if (!resp.ok) return `ERR:${resp.status}`;
-      return resp.text();
-    } catch (e: any) { return `ERR:${e?.message ?? "unknown"}`; }
-  }, "ReportViewer1$ctl03$ctl00").catch(() => null);
+      return `crafted ClientState for ${targetId}`;
+    }
+    return "no fallback available";
+  }, termId).catch((e: Error) => String(e));
 
-  if (payload && !payload.startsWith("ERR:")) {
-    logger.debug({ termId, len: payload.length, snippet: payload.substring(0, 200) }, "Columbus Tx: UpdatePanel response");
-    const upRows = parseUpdatePanelResponse(payload, termId);
-    if (upRows.length > 0) return upRows;
-    const htmlRows = parseTransactionHtml(payload, termId);
-    if (htmlRows.length > 0) return htmlRows;
-  } else {
-    logger.warn({ termId, payload }, "Columbus Tx: UpdatePanel POST failed");
-  }
+  logger.debug({ termId, domClickResult, jsSelectResult }, "Columbus Tx: terminal selection");
 
-  // Check DOM again after UpdatePanel (page may have updated)
-  await sleep(2_000);
-  domRows = await parseTableFromDom(page, termId);
-  if (domRows.length > 0) return domRows;
+  // ── 2. Set date range via Telerik RadDatePicker JS API ────────────────────
+  const [startMs, endMs] = [
+    (() => { const d = new Date(startStr); d.setHours(0, 0, 0, 0); return d.getTime(); })(),
+    (() => { const d = new Date(endStr);   d.setHours(23, 59, 0, 0); return d.getTime(); })(),
+  ];
 
-  logger.warn({ termId, payloadSnippet: payload?.substring(0, 200) }, "Columbus Tx: no rows found after all attempts");
-  return [];
+  await page.evaluate((sMs: number, eMs: number) => {
+    const w     = window as any;
+    const sDate = new Date(sMs);
+    const eDate = new Date(eMs);
+    const bp    = w.$find?.("txtBeginDateTime1");
+    const ep    = w.$find?.("txtEndingDateTime1");
+    if (bp) bp.set_selectedDate(sDate);
+    if (ep) ep.set_selectedDate(eDate);
+
+    // Belt-and-suspenders: also update raw hidden inputs
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const fmt = (d: Date) =>
+      `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-${pad(d.getHours())}-${pad(d.getMinutes())}-00`;
+    const fmtDisplay = (d: Date) =>
+      `${pad(d.getMonth() + 1)}/${pad(d.getDate())}/${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    const s = (id: string) => document.getElementById(id) as HTMLInputElement | null;
+    if (s("txtBeginDateTime1"))            s("txtBeginDateTime1")!.value            = fmt(sDate);
+    if (s("txtBeginDateTime1_dateInput"))  s("txtBeginDateTime1_dateInput")!.value  = fmtDisplay(sDate);
+    if (s("txtEndingDateTime1"))           s("txtEndingDateTime1")!.value           = fmt(eDate);
+    if (s("txtEndingDateTime1_dateInput")) s("txtEndingDateTime1_dateInput")!.value = fmtDisplay(eDate);
+  }, startMs, endMs).catch(() => null);
+
+  await sleep(300);
+
+  // ── 3. Submit form via __EVENTTARGET=lnkView ──────────────────────────────
+  // Calling window.__doPostBack() directly from page.evaluate throws a
+  // strict-mode TypeError. Setting hidden inputs + form.submit() is equivalent.
+  await Promise.all([
+    page.waitForNavigation({ waitUntil: "load", timeout: 20_000 }).catch(() => null),
+    page.evaluate(() => {
+      const t = document.getElementById("__EVENTTARGET")   as HTMLInputElement | null;
+      const a = document.getElementById("__EVENTARGUMENT") as HTMLInputElement | null;
+      if (t) t.value = "lnkView";
+      if (a) a.value = "";
+      (document.getElementById("Form1") as HTMLFormElement | null)?.submit();
+    }),
+  ]);
+
+  // ── 4. Extract journal text from Table1 ───────────────────────────────────
+  const tableText = await page.evaluate(() => {
+    const t = document.getElementById("Table1");
+    return t ? t.textContent ?? "" : "";
+  }).catch(() => "");
+
+  logger.debug({ termId, tableTextLen: tableText.length }, "Columbus Tx: journal page loaded");
+
+  const records = parseJournalText(tableText, termId);
+  logger.info({ termId, count: records.length }, "Columbus Tx: parsed journal");
+  return records;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -244,7 +286,95 @@ function sleep(ms: number): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Parse ASP.NET UpdatePanel response format
+// Parse journal.aspx Table1 text content → ColumbusTransactionRecord[]
+//
+// Table1 text is a sequence of transaction blocks separated by "Terminal ID:".
+// Each block looks like:
+//
+//   Terminal ID: L745870
+//   Date/Time: 05/15/2026 15:26:23 PM
+//   Business Date: 05/15/2026
+//   Src Acct: Checking
+//   Dest Acct: No Destination Account
+//   Seq #: 0567
+//   Account #: ************8147
+//   Tran Type: Cash Withdrawal
+//   Requested: $40.00
+//   Dispensed: $40.00
+//   Surcharge: $3.60
+//   Term Err: 0000000
+//   Reversal Status: Transaction
+//
+// "UNDEFINED JOURNAL" blocks are filtered out.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function parseJournalText(text: string, termId: string): ColumbusTransactionRecord[] {
+  if (!text.trim()) return [];
+
+  const parseDollar = (s: string | undefined): number | null => {
+    if (!s) return null;
+    const n = parseFloat(s.replace(/[$,\s]/g, ""));
+    return isNaN(n) ? null : n;
+  };
+
+  // Field extractor: "Label: value" → value string
+  const field = (block: string, label: string): string | null => {
+    const re = new RegExp(`${label}\\s*:\\s*(.+?)(?=\\n|$)`, "i");
+    const m  = block.match(re);
+    return m ? m[1].trim() : null;
+  };
+
+  // Split into blocks on every occurrence of "Terminal ID:"
+  // The first element before the first occurrence is header/empty — drop it.
+  const rawBlocks = text.split(/(?=Terminal ID\s*:)/i).filter(b => b.trim());
+
+  const records: ColumbusTransactionRecord[] = [];
+
+  for (const block of rawBlocks) {
+    // Skip undefined journal entries (no real transaction data)
+    if (/UNDEFINED JOURNAL/i.test(block)) continue;
+
+    // Must have a Date/Time to be a real transaction
+    const dateTimeRaw = field(block, "Date/Time");
+    if (!dateTimeRaw) continue;
+
+    // Normalise timestamp: "05/15/2026 15:26:23 PM" → ISO-ish string
+    // We store it as-is; callers can convert as needed.
+    const transactedAt = dateTimeRaw;
+
+    // Use block's own terminal ID if present, else fall back to the argument
+    const blockTermId = field(block, "Terminal ID") ?? termId;
+
+    const tranType    = field(block, "Tran Type");
+    const accountRaw  = field(block, "Account #");
+    const seqRaw      = field(block, "Seq #");
+    const requestedRaw = field(block, "Requested");
+    const dispensedRaw = field(block, "Dispensed");
+    const surchargeRaw = field(block, "Surcharge");
+    const reversalRaw  = field(block, "Reversal Status");
+
+    // Filter out non-dispensing transaction types if completely empty
+    if (!tranType && !requestedRaw && !dispensedRaw) continue;
+
+    records.push({
+      terminalId:      blockTermId,
+      transactedAt,
+      transactionType: tranType,
+      cardNumber:      accountRaw,
+      amountRequested: parseDollar(requestedRaw ?? undefined),
+      feeRequested:    null,          // journal doesn't separate fee from surcharge on request side
+      amountDispensed: parseDollar(dispensedRaw ?? undefined),
+      feeAmount:       parseDollar(surchargeRaw ?? undefined),
+      termSeq:         seqRaw,
+      response:        reversalRaw,
+    });
+  }
+
+  return records;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Parse ASP.NET UpdatePanel response format (kept for reference — no longer used)
 // Format: {len}|{type}|{id}|{content}|   (repeating)
 // ─────────────────────────────────────────────────────────────────────────────
 
