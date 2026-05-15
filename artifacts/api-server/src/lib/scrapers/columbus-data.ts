@@ -81,6 +81,14 @@ export async function scrapeColumbusData(
     page.setDefaultNavigationTimeout(90_000);
     page.setDefaultTimeout(30_000);
 
+    // Bypass bot detection: SSRS JS detects navigator.webdriver=true and
+    // redirects to cdsatm.com (blocking page) instead of rendering the report.
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+      Object.defineProperty(navigator, "plugins",   { get: () => [1, 2, 3, 4, 5] });
+      Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
+    });
+
     // ── 1. Login ──────────────────────────────────────────────────────────
     logger.info("Columbus Data: logging in");
     await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded" });
@@ -203,13 +211,32 @@ async function scrapeReportViewer(
   };
   page.on("response", onResponse);
 
+  const sleepMs = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+
   try {
     await page.goto(url, { waitUntil: "load" });
 
-    // Same root-cause as transactions: SSRS renders via OpType=ReportPage iframe
-    // navigation which redirects to cdsatm.com. Fire the UpdatePanel POST
-    // ourselves from inside the page context — that way session cookies and
-    // ViewState are automatically correct.
+    // With bot-detection bypass (navigator.webdriver=undefined), SSRS JS
+    // should now auto-render the report instead of redirecting to cdsatm.com.
+    // Poll DOM every 500ms for up to 15s for auto-render.
+    for (let i = 0; i < 30; i++) {
+      await sleepMs(500);
+      const allFrames: Frame[] = [page.mainFrame(), ...page.frames().filter(f => f !== page.mainFrame())];
+      for (const frame of allFrames) {
+        try {
+          const rows = await extractTableFromFrame(frame, reportName, frame.url()).catch(() => null);
+          if (rows && rows.length > 0) {
+            logger.info({ reportName, count: rows.length, method: "auto-render", attempt: i }, "Columbus Data: SSRS auto-rendered");
+            const map = new Map<string, InfoRow>();
+            for (const row of rows) { if (row.terminalId) map.set(row.terminalId, row); }
+            return map;
+          }
+        } catch { /* cross-origin frame or detached */ }
+      }
+    }
+
+    // SSRS didn't auto-render — fire UpdatePanel POST manually
+    logger.debug({ reportName }, "Columbus Data: DOM empty after 15s, firing manual UpdatePanel POST");
     const reportPayload = await page.evaluate(async (postbackTarget: string): Promise<string | null> => {
       try {
         const form = document.querySelector<HTMLFormElement>("#form1, form");
@@ -226,8 +253,7 @@ async function scrapeReportViewer(
         const smId: string = sm?._scriptManagerID ?? "ScriptManager1";
         params.set(smId, `${smId}|${postbackTarget}`);
         const resp = await fetch(form.action, {
-          method: "POST",
-          credentials: "include",
+          method: "POST", credentials: "include",
           headers: {
             "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
             "X-MicrosoftAjax": "Delta=true",
