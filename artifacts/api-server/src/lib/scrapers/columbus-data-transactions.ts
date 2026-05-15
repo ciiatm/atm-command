@@ -775,14 +775,12 @@ export async function debugScrapeTerminal(
 
     // ── Test report.aspx (the CORRECT portal URL format for SSRS reports) ──
     // Portal uses /includes/report.aspx?rptname=xxx, NOT /includes/ReportViewer.aspx
-    const end   = new Date();
-    const start = new Date();
-    start.setDate(start.getDate() - 60);
     const reportAspxUrl =
       `https://www.columbusdata.net/cdswebtool/includes/report.aspx?rptname=${REPORT_NAME}` +
       `&TermID=${encodeURIComponent(termId)}` +
       `&StartDate=${encodeURIComponent(formatDate(start))}` +
       `&EndDate=${encodeURIComponent(formatDate(end))}`;
+    // start/end already declared above (they're in same scope)
     diag.reportAspxUrl = reportAspxUrl;
     await page.goto(reportAspxUrl, { waitUntil: "load" });
     await sleep(3_000);
