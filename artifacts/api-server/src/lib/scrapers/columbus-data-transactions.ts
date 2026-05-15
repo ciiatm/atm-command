@@ -908,19 +908,38 @@ export async function debugScrapeTerminal(
       return "no fallback available";
     }, termId).catch((e: Error) => String(e));
 
-    // Step 2: Fix date range — set to 60 days back (the form shows 24h default)
-    const startFmt = `${start.getFullYear()}-${String(start.getMonth()+1).padStart(2,"0")}-${String(start.getDate()).padStart(2,"0")}-00-00-00`;
-    const endFmt   = `${end.getFullYear()}-${String(end.getMonth()+1).padStart(2,"0")}-${String(end.getDate()).padStart(2,"0")}-23-59-00`;
-    const startDisplay = `${start.getMonth()+1}/${start.getDate()}/${start.getFullYear()} 12:00 AM`;
-    const endDisplay   = `${end.getMonth()+1}/${end.getDate()}/${end.getFullYear()} 11:59 PM`;
-    diag.journalDateSet = await page.evaluate((sf: string, ef: string, sd: string, ed: string) => {
+    // Step 2: Fix date range — use Telerik RadDatePicker JS API to set properly
+    // (just setting text inputs doesn't update the hidden ClientState; the server
+    //  reads from ClientState for validation, hence "dates required" error)
+    diag.journalDateSet = await page.evaluate((sMs: number, eMs: number) => {
+      const w = window as any;
+      const results: string[] = [];
+
+      const sDate = new Date(sMs);
+      const eDate = new Date(eMs);
+      // Make end date 11:59 PM
+      eDate.setHours(23, 59, 0, 0);
+      // Make start date 12:00 AM
+      sDate.setHours(0, 0, 0, 0);
+
+      // Try Telerik RadDatePicker JS API
+      const beginPicker = w.$find?.("txtBeginDateTime1");
+      if (beginPicker) { beginPicker.set_selectedDate(sDate); results.push("beginPicker.set_selectedDate"); }
+      const endPicker = w.$find?.("txtEndingDateTime1");
+      if (endPicker)   { endPicker.set_selectedDate(eDate);   results.push("endPicker.set_selectedDate"); }
+
+      // Also update raw inputs as belt-and-suspenders
+      const pad = (n: number) => String(n).padStart(2, "0");
+      const toFmt = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}-${pad(d.getHours())}-${pad(d.getMinutes())}-00`;
+      const toDisp = (d: Date) => `${d.getMonth()+1}/${d.getDate()}/${d.getFullYear()} ${d.getHours() === 0 ? "12:00 AM" : "11:59 PM"}`;
       const s = (id: string) => document.getElementById(id) as HTMLInputElement;
-      if (s("txtBeginDateTime1")) s("txtBeginDateTime1").value = sf;
-      if (s("txtBeginDateTime1_dateInput")) s("txtBeginDateTime1_dateInput").value = sd;
-      if (s("txtEndingDateTime1")) s("txtEndingDateTime1").value = ef;
-      if (s("txtEndingDateTime1_dateInput")) s("txtEndingDateTime1_dateInput").value = ed;
-      return `begin=${sf} end=${ef}`;
-    }, startFmt, endFmt, startDisplay, endDisplay).catch((e: Error) => String(e));
+      if (s("txtBeginDateTime1"))             s("txtBeginDateTime1").value = toFmt(sDate);
+      if (s("txtBeginDateTime1_dateInput"))   s("txtBeginDateTime1_dateInput").value = toDisp(sDate);
+      if (s("txtEndingDateTime1"))             s("txtEndingDateTime1").value = toFmt(eDate);
+      if (s("txtEndingDateTime1_dateInput"))   s("txtEndingDateTime1_dateInput").value = toDisp(eDate);
+
+      return results.length ? results.join(", ") : "only raw inputs set (no Telerik pickers)";
+    }, start.getTime(), end.getTime()).catch((e: Error) => String(e));
 
     // Step 3: Submit — set __EVENTTARGET=lnkView then submit form
     // (avoids calling __doPostBack directly which throws in strict-mode evaluate context)
