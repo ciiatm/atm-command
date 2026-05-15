@@ -705,6 +705,60 @@ export async function debugScrapeTerminal(
       }, target, argument, overrides).catch((e: any) => `ERR:${(e as Error).message}`);
     }
 
+    // ── Node.js-side OpType=ReportPage test (bypasses browser JS detection) ──
+    // If the server redirects our browser request to cdsatm.com but NOT a
+    // Node.js HTTP request, the problem is browser-JS-based detection.
+    // If BOTH redirect, the problem is server-side (IP/session/header check).
+    if (controlId) {
+      try {
+        const sessionCookies = await page.cookies();
+        const cookieStr = sessionCookies.map(c => `${c.name}=${c.value}`).join("; ");
+        const reportPageUrl = `https://www.columbusdata.net/cdswebtool/Reserved.ReportViewerWebControl.axd?OpType=ReportPage&Version=${encodeURIComponent(SSRS_VERSION)}&ControlID=${controlId}&Culture=en-US&UICulture=en-US&ReportStack=1`;
+        const exportUrl     = `https://www.columbusdata.net/cdswebtool/Reserved.ReportViewerWebControl.axd?OpType=Export&Version=${encodeURIComponent(SSRS_VERSION)}&ControlID=${controlId}&Culture=en-US&UICulture=en-US&ReportStack=1&ExportFormat=CSV`;
+
+        const rpResp = await fetch(reportPageUrl, {
+          redirect: "manual",
+          headers: {
+            "Cookie": cookieStr,
+            "User-Agent": CHROME_UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": diag.url as string,
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Dest": "document",
+          },
+        });
+        const rpLocation = rpResp.headers.get("location") ?? "";
+        const rpBody = rpResp.status === 200 ? (await rpResp.text()).substring(0, 500) : "";
+        diag.nodeFetch_ReportPage = {
+          status: rpResp.status,
+          redirected: rpResp.redirected,
+          location: rpLocation,
+          bodySnippet: rpBody,
+        };
+
+        // If ReportPage returned 200, try Export from Node.js
+        if (rpResp.status === 200) {
+          await sleep(500);
+          const exResp = await fetch(exportUrl, {
+            headers: {
+              "Cookie": cookieStr,
+              "User-Agent": CHROME_UA,
+              "Accept": "*/*",
+              "Accept-Language": "en-US,en;q=0.9",
+              "Referer": diag.url as string,
+            },
+          });
+          const exText = await exResp.text();
+          diag.nodeFetch_Export = { status: exResp.status, len: exText.length, csvSnippet: exText.substring(0, 1000) };
+        } else {
+          diag.nodeFetch_Export = { skipped: `ReportPage returned ${rpResp.status}, location=${rpLocation}` };
+        }
+      } catch (e: any) {
+        diag.nodeFetch_Error = String(e?.message ?? e);
+      }
+    }
+
     // Test A: $ctl09$ReportControl$ctl00 with Navigate1 (report control postback — what SSRS JS actually calls)
     diag.postResult_reportCtl_Navigate1 = await testPostbackExt("ReportViewer1$ctl09$ReportControl$ctl00", "Navigate1");
 
