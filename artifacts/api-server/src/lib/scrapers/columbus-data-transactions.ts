@@ -156,6 +156,54 @@ export async function debugScrapeTerminal(
   diag.hasTran = /tran/i.test(postBody);
   diag.hasAmt = /amt/i.test(postBody);
 
+  // ── Try ReportPage endpoint directly (how SSRS JS actually renders the report) ──
+  const effectiveControlId = controlId ?? extractControlId(postBody);
+  if (effectiveControlId) {
+    const reportPageUrl =
+      `${SSRS_HANDLER_BASE}?OpType=ReportPage` +
+      `&Version=${encodeURIComponent(SSRS_VERSION)}` +
+      `&ControlID=${effectiveControlId}` +
+      `&Culture=en-US&UICulture=en-US&ReportStack=1&ParameterLanguage=en-US`;
+    try {
+      const rpResp = await fetchWithTimeout(reportPageUrl, { method: "GET", headers: baseHeaders }, 30_000);
+      const rpBody = await rpResp.text();
+      diag.reportPageStatus = rpResp.status;
+      diag.reportPageBodyLen = rpBody.length;
+      diag.reportPageSnippet = rpBody.substring(0, 1000);
+      diag.reportPageHasTran = /tran/i.test(rpBody);
+      diag.reportPageHasAmt = /amt/i.test(rpBody);
+      diag.reportPageTableCount = (rpBody.match(/<table/gi) ?? []).length;
+    } catch (e) {
+      diag.reportPageError = (e as Error).message;
+    }
+  }
+
+  // ── Try regular (non-AJAX) full form POST ──────────────────────────────────
+  try {
+    const fullPostResp = await fetchWithTimeout(
+      `${REPORT_BASE}?reportname=${REPORT_NAME}`,
+      {
+        method: "POST",
+        headers: {
+          ...baseHeaders,
+          "Content-Type": "application/x-www-form-urlencoded",
+          "Referer": reportUrl,
+        },
+        body: formData.toString(),
+      },
+      30_000,
+    );
+    const fullPostBody = await fullPostResp.text();
+    diag.fullPostStatus = fullPostResp.status;
+    diag.fullPostBodyLen = fullPostBody.length;
+    diag.fullPostSnippet = fullPostBody.substring(0, 1000);
+    diag.fullPostTableCount = (fullPostBody.match(/<table/gi) ?? []).length;
+    diag.fullPostHasTran = /tran/i.test(fullPostBody);
+    diag.fullPostHasAmt = /amt/i.test(fullPostBody);
+  } catch (e) {
+    diag.fullPostError = (e as Error).message;
+  }
+
   return diag;
 }
 
