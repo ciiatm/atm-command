@@ -584,7 +584,24 @@ export async function debugScrapeTerminal(
           body: params.toString(),
         });
         const text = await resp.text();
-        return `STATUS:${resp.status} REDIRECTED:${resp.redirected} URL:${resp.url} LEN:${text.length} SNIPPET:${text.substring(0, 600)}`;
+        // Parse UpdatePanel sections to list types
+        const sections: string[] = [];
+        let pos = 0;
+        while (pos < text.length && sections.length < 30) {
+          const p1 = text.indexOf("|", pos); if (p1 < 0) break;
+          const len = parseInt(text.substring(pos, p1), 10); if (isNaN(len)) break;
+          const p2 = text.indexOf("|", p1 + 1); if (p2 < 0) break;
+          const type = text.substring(p1 + 1, p2);
+          const p3 = text.indexOf("|", p2 + 1); if (p3 < 0) break;
+          const id = text.substring(p2 + 1, p3);
+          const contentStart = p3 + 1;
+          if (contentStart + len > text.length) break;
+          const content = text.substring(contentStart, contentStart + len);
+          sections.push(`${type}/${id}(${len})`);
+          if (type === "updatePanel") sections.push(`HTML_SNIPPET:${content.substring(0, 200)}`);
+          pos = contentStart + len + 1;
+        }
+        return `STATUS:${resp.status} REDIRECTED:${resp.redirected} LEN:${text.length} SECTIONS:${JSON.stringify(sections)} TAIL:${text.substring(text.length - 200)}`;
       } catch (e: any) {
         return `ERR:${e?.message ?? "unknown"}`;
       }
