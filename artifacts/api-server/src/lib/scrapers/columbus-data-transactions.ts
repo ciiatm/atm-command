@@ -182,19 +182,20 @@ async function scrapeOneTerminal(
     logger.debug({ termId }, "Columbus Tx: navigating");
     await page.goto(url, { waitUntil: "load" });
 
-    // Wait up to 10s for SSRS to auto-trigger the render
-    let waited = 0;
-    while (!reportPayload && waited < 10_000) {
-      await sleep(1_000);
-      waited += 1_000;
+    // Total budget: 75s per terminal.
+    // First 10s: let SSRS auto-render; then force __doPostBack; then wait the rest.
+    const deadline = Date.now() + 75_000;
+    const autoDeadline = Date.now() + 10_000;
+
+    while (!reportPayload && Date.now() < autoDeadline) {
+      await sleep(1_500);
     }
 
-    // If SSRS hasn't auto-triggered (stuck at Loading...), explicitly fire __doPostBack
+    // If SSRS hasn't auto-triggered, explicitly fire __doPostBack
     if (!reportPayload) {
       logger.debug({ termId }, "Columbus Tx: no auto-render after 10s, calling __doPostBack explicitly");
       await page.evaluate(() => {
         try {
-          // Try the SSRS view-report button first
           const btn = document.querySelector<HTMLInputElement>(
             "#ReportViewer1_ctl03_ctl00, input[id*='ctl03_ctl00']"
           );
@@ -205,11 +206,10 @@ async function scrapeOneTerminal(
             (window as any).__doPostBack("ReportViewer1$ctl03$ctl00", "");
           }
         } catch {}
-      });
+      }).catch(() => {});
     }
 
-    // Wait up to 90s total for report payload
-    const deadline = Date.now() + 90_000;
+    // Wait out remaining budget
     while (!reportPayload && Date.now() < deadline) {
       await sleep(2_000);
     }
