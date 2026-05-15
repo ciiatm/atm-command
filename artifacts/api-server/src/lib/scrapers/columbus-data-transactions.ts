@@ -816,25 +816,58 @@ export async function debugScrapeTerminal(
         })
     ).catch(() => []);
 
-    // Try to click "View Journal" button
-    try {
-      await page.click("input[value*='View'], button:contains('View'), input[id*='btnView'], input[id*='View']");
-      await sleep(3_000);
-    } catch { /* button not found, try submit */ }
+    // Snapshot form fields BEFORE submission
+    diag.journalPreSubmitBody = (await page.content()).substring(0, 2000);
 
-    // Try to submit the form directly if clicking didn't work
+    // Try to click "View Journal" button (standard CSS only — no :contains)
+    let journalSubmitClicked = false;
     try {
-      await page.evaluate(() => {
-        const form = document.querySelector<HTMLFormElement>("#Form1, form");
-        form?.submit();
-      });
-      await sleep(3_000);
-    } catch {}
+      // Try common submit button selectors
+      const btnSelectors = [
+        "input[value*='View']",
+        "input[id*='btnView']",
+        "input[id*='View'][type='submit']",
+        "button[type='submit']",
+        "input[type='submit']",
+      ];
+      for (const sel of btnSelectors) {
+        const btn = await page.$(sel);
+        if (btn) {
+          await Promise.all([
+            page.waitForNavigation({ waitUntil: "load", timeout: 10_000 }).catch(() => null),
+            btn.click(),
+          ]);
+          journalSubmitClicked = true;
+          diag.journalSubmitSelector = sel;
+          break;
+        }
+      }
+    } catch (e) {
+      diag.journalClickError = String(e);
+    }
+
+    // If no button found, try direct form.submit() with waitForNavigation
+    if (!journalSubmitClicked) {
+      try {
+        await Promise.all([
+          page.waitForNavigation({ waitUntil: "load", timeout: 10_000 }).catch(() => null),
+          page.evaluate(() => {
+            const form = document.querySelector<HTMLFormElement>("#Form1, form");
+            form?.submit();
+          }),
+        ]);
+        diag.journalSubmitMethod = "form.submit()";
+      } catch (e) {
+        diag.journalSubmitError = String(e);
+      }
+    }
+
+    await sleep(1_000);
 
     diag.journal = {
       url: page.url(),
-      title: await page.title(),
-      bodySnippet: (await page.content()).substring(0, 3000),
+      title: await page.title().catch(() => "(detached)"),
+      bodySnippet: (await page.content().catch(() => "")).substring(0, 3000),
       domTables: await page.evaluate(() =>
         Array.from(document.querySelectorAll("table")).map(t => ({
           id: t.id, rows: t.rows.length, text: (t.textContent ?? "").substring(0, 500),
