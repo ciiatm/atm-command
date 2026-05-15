@@ -1,26 +1,32 @@
 /**
- * Columbus Data Transaction Scraper (Scraper 2)
+ * Columbus Data Transaction Scraper
  *
- * Key finding (from network/HTML investigation):
- *   When TermID + date params are in the URL, SSRS hides the parameter row and
- *   auto-renders by firing Reserved.ReportViewerWebControl.axd?OpType=ReportPage
- *   via JavaScript. Plain HTTP fetch cannot trigger this — Puppeteer is required.
+ * SSRS WebForms flow:
+ *   1. Page loads with URL params → SSRS hides ParametersRow, auto-renders
+ *   2. SSRS JS calls __doPostBack('ReportViewer1$ctl03$ctl00','') → UpdatePanel POST
+ *   3. Server renders report → UpdatePanel response (or inline DOM update)
+ *   4. SSRS JS may then request OpType=ReportPage for the actual HTML
  *
- * Strategy: ONE browser, ONE page, terminals scraped sequentially.
- *   - No multi-page concurrency (crashes under --single-process on EC2).
- *   - After navigation, wait for SSRS JS to fire the ReportPage XHR.
- *   - Capture report HTML from the XHR response directly (intercept network).
- *   - Fall back to DOM table parsing if interception misses it.
+ * Strategy:
+ *   - ONE browser, ONE page, sequential terminals (avoids --single-process crashes)
+ *   - After navigation: intercept ALL POST responses to ReportViewer.aspx
+ *   - Also intercept OpType=ReportPage responses
+ *   - If neither fires in 10s, explicitly call __doPostBack to force render
+ *   - Wait up to 90s total
+ *   - Parse UpdatePanel format OR raw HTML OR DOM table
  */
 
-import puppeteer, { type Browser, type Page } from "puppeteer";
+import puppeteer, { type Browser, type Page, type HTTPResponse, type HTTPRequest } from "puppeteer";
 import { execSync } from "node:child_process";
 import { logger } from "../logger.js";
 
-const LOGIN_URL      = "https://www.columbusdata.net/cdswebtool/login/login.aspx";
-const REPORT_BASE    = "https://www.columbusdata.net/cdswebtool/includes/ReportViewer.aspx";
-const REPORT_NAME    = "rptTransactionDetailByTIDWithBalance";
-const SSRS_HANDLER   = "Reserved.ReportViewerWebControl.axd";
+const LOGIN_URL   = "https://www.columbusdata.net/cdswebtool/login/login.aspx";
+const REPORT_BASE = "https://www.columbusdata.net/cdswebtool/includes/ReportViewer.aspx";
+const REPORT_NAME = "rptTransactionDetailByTIDWithBalance";
+const SSRS_HANDLER = "Reserved.ReportViewerWebControl.axd";
+
+// Real-browser user-agent (Chrome 124 on macOS)
+const CHROME_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 export interface ColumbusTransactionRecord {
   terminalId: string;
@@ -83,17 +89,19 @@ export async function scrapeColumbusTransactions(
     });
 
     const page = await browser.newPage();
-    page.setDefaultNavigationTimeout(60_000);
+    await page.setUserAgent(CHROME_UA);
+    await page.setViewport({ width: 1280, height: 900 });
+    page.setDefaultNavigationTimeout(90_000);
     page.setDefaultTimeout(30_000);
 
     // ── Login ──────────────────────────────────────────────────────────────
     logger.info("Columbus Tx: logging in");
-    await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded" });
+    await page.goto(LOGIN_URL, { waitUntil: "load" });
     await page.waitForSelector("#UsernameTextbox", { visible: true });
     await page.type("#UsernameTextbox", username, { delay: 30 });
     await page.type("#PasswordTextbox", password, { delay: 30 });
     await Promise.all([
-      page.waitForNavigation({ waitUntil: "domcontentloaded" }),
+      page.waitForNavigation({ waitUntil: "load" }),
       page.click("#LoginButton"),
     ]);
     if (/login/i.test(page.url())) {
@@ -101,7 +109,7 @@ export async function scrapeColumbusTransactions(
     }
     logger.info("Columbus Tx: login ok");
 
-    // ── Scrape terminals sequentially (single page — avoids --single-process crashes) ──
+    // ── Scrape terminals sequentially ─────────────────────────────────────
     const end   = new Date();
     const start = new Date();
     start.setDate(start.getDate() - 60);
@@ -128,7 +136,7 @@ export async function scrapeColumbusTransactions(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Scrape one terminal — intercept the SSRS ReportPage XHR for its HTML
+// Scrape one terminal — intercept UpdatePanel POST + OpType=ReportPage
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function scrapeOneTerminal(
@@ -143,131 +151,153 @@ async function scrapeOneTerminal(
     `&StartDate=${encodeURIComponent(startStr)}` +
     `&EndDate=${encodeURIComponent(endStr)}`;
 
-  // Intercept the SSRS ReportPage response — this is where the rendered HTML lives
-  let reportHtml: string | null = null;
+  // Collect any response that looks like report content
+  let reportPayload: { html: string; source: string } | null = null;
 
-  const onResponse = async (response: import("puppeteer").HTTPResponse) => {
+  const onResponse = async (response: HTTPResponse) => {
+    if (reportPayload) return; // already have data
     try {
-      if (
-        response.url().includes(SSRS_HANDLER) &&
-        response.url().includes("OpType=ReportPage")
-      ) {
+      const rUrl  = response.url();
+      const meth  = response.request().method();
+      const ctype = response.headers()["content-type"] ?? "";
+
+      // UpdatePanel POST response (text/plain with pipe-delimited format)
+      const isUpdatePanel = meth === "POST" && rUrl.includes("ReportViewer.aspx");
+      // SSRS rendered-page response
+      const isReportPage  = rUrl.includes(SSRS_HANDLER) && rUrl.includes("OpType=ReportPage");
+
+      if (isUpdatePanel || isReportPage) {
         const text = await response.text().catch(() => "");
-        if (text.length > 100) {
-          reportHtml = text;
-          logger.debug({ termId, len: text.length }, "Columbus Tx: captured ReportPage XHR");
+        if (text.length > 200) {
+          reportPayload = { html: text, source: isUpdatePanel ? "updatePanel" : "reportPage" };
+          logger.debug({ termId, len: text.length, source: reportPayload.source }, "Columbus Tx: captured report payload");
         }
       }
     } catch {}
   };
+
   page.on("response", onResponse);
 
   try {
     logger.debug({ termId }, "Columbus Tx: navigating");
-    await page.goto(url, { waitUntil: "domcontentloaded" });
+    await page.goto(url, { waitUntil: "load" });
 
-    // Wait up to 30s for the ReportPage XHR to fire and return data
-    const deadline = Date.now() + 30_000;
-    while (!reportHtml && Date.now() < deadline) {
-      await new Promise(r => setTimeout(r, 1_500));
+    // Wait up to 10s for SSRS to auto-trigger the render
+    let waited = 0;
+    while (!reportPayload && waited < 10_000) {
+      await sleep(1_000);
+      waited += 1_000;
     }
 
-    // If we captured the ReportPage HTML, parse it
-    if (reportHtml) {
-      const rows = parseTransactionHtml(reportHtml, termId);
-      if (rows.length > 0) return rows;
-      logger.debug({ termId, htmlLen: reportHtml.length, snippet: reportHtml.substring(0, 200) }, "Columbus Tx: ReportPage captured but no rows parsed");
+    // If SSRS hasn't auto-triggered (stuck at Loading...), explicitly fire __doPostBack
+    if (!reportPayload) {
+      logger.debug({ termId }, "Columbus Tx: no auto-render after 10s, calling __doPostBack explicitly");
+      await page.evaluate(() => {
+        try {
+          // Try the SSRS view-report button first
+          const btn = document.querySelector<HTMLInputElement>(
+            "#ReportViewer1_ctl03_ctl00, input[id*='ctl03_ctl00']"
+          );
+          if (btn) { btn.click(); return; }
+        } catch {}
+        try {
+          if (typeof (window as any).__doPostBack === "function") {
+            (window as any).__doPostBack("ReportViewer1$ctl03$ctl00", "");
+          }
+        } catch {}
+      });
+    }
+
+    // Wait up to 90s total for report payload
+    const deadline = Date.now() + 90_000;
+    while (!reportPayload && Date.now() < deadline) {
+      await sleep(2_000);
+    }
+
+    if (reportPayload) {
+      // Try UpdatePanel format first
+      const upRows = parseUpdatePanelResponse(reportPayload.html, termId);
+      if (upRows.length > 0) {
+        logger.debug({ termId, count: upRows.length, source: reportPayload.source }, "Columbus Tx: parsed from UpdatePanel");
+        return upRows;
+      }
+      // Try as raw HTML
+      const htmlRows = parseTransactionHtml(reportPayload.html, termId);
+      if (htmlRows.length > 0) {
+        logger.debug({ termId, count: htmlRows.length, source: reportPayload.source }, "Columbus Tx: parsed from HTML");
+        return htmlRows;
+      }
+      logger.debug({ termId, len: reportPayload.html.length, snippet: reportPayload.html.substring(0, 300) }, "Columbus Tx: payload captured but no rows found");
     } else {
-      logger.debug({ termId }, "Columbus Tx: no ReportPage XHR seen, trying DOM");
+      logger.warn({ termId }, "Columbus Tx: no report payload after 90s");
     }
 
-    // Fallback: read the DOM directly (SSRS may have rendered inline)
+    // Final fallback: DOM parse
     const domRows = await parseTableFromDom(page, termId);
-    if (domRows.length > 0) return domRows;
+    if (domRows.length > 0) {
+      logger.debug({ termId, count: domRows.length }, "Columbus Tx: parsed from DOM");
+    }
+    return domRows;
 
-    logger.warn({ termId, gotReportHtml: !!reportHtml }, "Columbus Tx: no rows found");
-    return [];
   } finally {
     page.off("response", onResponse);
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Parse transaction table from DOM (Puppeteer page)
-// ─────────────────────────────────────────────────────────────────────────────
-
-async function parseTableFromDom(page: Page, termId: string): Promise<ColumbusTransactionRecord[]> {
-  return page.evaluate((tid: string) => {
-    function cell(el: Element | null | undefined): string {
-      return (el?.textContent ?? "").replace(/\s+/g, " ").trim();
-    }
-    function parseDollar(raw: string): number | null {
-      const n = parseFloat(raw.replace(/[$,\s]/g, ""));
-      return isNaN(n) ? null : n;
-    }
-
-    const tables = Array.from(document.querySelectorAll("table"));
-    let best: HTMLTableElement | null = null;
-    let bestScore = 0;
-    for (const t of tables) {
-      const txt = (t.textContent ?? "").toLowerCase();
-      let s = 0;
-      if (txt.includes("tran")) s += 3;
-      if (txt.includes("card")) s += 2;
-      if (txt.includes("amt"))  s += 2;
-      if (txt.includes("fee"))  s += 1;
-      if (s > bestScore && t.rows.length > 2) { bestScore = s; best = t; }
-    }
-    if (!best || bestScore < 4) return [];
-
-    const allRows = Array.from(best.querySelectorAll("tr"));
-    const headerRow = allRows.find(r => {
-      const t = (r.textContent ?? "").toLowerCase().replace(/\s+/g, "");
-      return (t.includes("tran") || t.includes("datetime")) && (t.includes("amt") || t.includes("card"));
-    });
-    if (!headerRow) return [];
-
-    const headers = Array.from(headerRow.querySelectorAll("th,td"))
-      .map(h => cell(h).toLowerCase().replace(/\s+/g, ""));
-
-    const idx = (kw: string) => headers.findIndex(h => h.includes(kw.replace(/\s+/g, "")));
-    const dateIdx    = idx("datetime") >= 0 ? idx("datetime") : idx("date") >= 0 ? idx("date") : 0;
-    const typeIdx    = idx("trantype") >= 0 ? idx("trantype") : idx("type") >= 0 ? idx("type") : -1;
-    const cardIdx    = idx("card");
-    const amtReqdIdx = idx("amtreqd") >= 0 ? idx("amtreqd") : idx("amtrequested");
-    const feeReqdIdx = idx("feereqd") >= 0 ? idx("feereqd") : idx("feelrequested");
-    const amtDispIdx = idx("amtdisp") >= 0 ? idx("amtdisp") : idx("amtdispensed");
-    const feeAmtIdx  = idx("feeamt") >= 0 ? idx("feeamt") : idx("feeamount");
-    const seqIdx     = idx("termseq") >= 0 ? idx("termseq") : idx("seq");
-    const respIdx    = idx("response");
-
-    const result: {terminalId:string;transactedAt:string;transactionType:string|null;cardNumber:string|null;amountRequested:number|null;feeRequested:number|null;amountDispensed:number|null;feeAmount:number|null;termSeq:string|null;response:string|null}[] = [];
-    const hi = allRows.indexOf(headerRow);
-    for (let i = hi + 1; i < allRows.length; i++) {
-      const cells = Array.from(allRows[i].querySelectorAll("td"));
-      if (cells.length < 2) continue;
-      const dateRaw = cell(cells[dateIdx]);
-      if (!dateRaw || /^total|grand|sub/i.test(dateRaw)) continue;
-      const g = (ix: number) => ix >= 0 && cells[ix] ? cell(cells[ix]) || null : null;
-      result.push({
-        terminalId: tid,
-        transactedAt: dateRaw,
-        transactionType: g(typeIdx),
-        cardNumber: g(cardIdx),
-        amountRequested: amtReqdIdx >= 0 ? parseDollar(cell(cells[amtReqdIdx])) : null,
-        feeRequested:    feeReqdIdx >= 0 ? parseDollar(cell(cells[feeReqdIdx])) : null,
-        amountDispensed: amtDispIdx >= 0 ? parseDollar(cell(cells[amtDispIdx])) : null,
-        feeAmount:       feeAmtIdx  >= 0 ? parseDollar(cell(cells[feeAmtIdx]))  : null,
-        termSeq:  g(seqIdx),
-        response: g(respIdx),
-      });
-    }
-    return result;
-  }, termId).catch(() => []);
+function sleep(ms: number): Promise<void> {
+  return new Promise(r => setTimeout(r, ms));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Parse transaction table from raw HTML string (ReportPage XHR body)
+// Parse ASP.NET UpdatePanel response format
+// Format: {len}|{type}|{id}|{content}|   (repeating)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function parseUpdatePanelResponse(text: string, termId: string): ColumbusTransactionRecord[] {
+  // Quick check: does this look like an UpdatePanel response?
+  if (!text.match(/^\d+\|/)) return [];
+
+  const htmlSections: string[] = [];
+  let pos = 0;
+  while (pos < text.length) {
+    // Read length
+    const pipe1 = text.indexOf("|", pos);
+    if (pipe1 < 0) break;
+    const len = parseInt(text.substring(pos, pipe1), 10);
+    if (isNaN(len)) break;
+
+    // Read type
+    const pipe2 = text.indexOf("|", pipe1 + 1);
+    if (pipe2 < 0) break;
+    const type = text.substring(pipe1 + 1, pipe2);
+
+    // Read id
+    const pipe3 = text.indexOf("|", pipe2 + 1);
+    if (pipe3 < 0) break;
+    // const id = text.substring(pipe2 + 1, pipe3);
+
+    // Read content (exactly `len` characters)
+    const contentStart = pipe3 + 1;
+    if (contentStart + len > text.length) break;
+    const content = text.substring(contentStart, contentStart + len);
+
+    if (type === "updatePanel" && content.includes("<table")) {
+      htmlSections.push(content);
+    }
+
+    // Skip trailing pipe
+    pos = contentStart + len + 1;
+  }
+
+  for (const html of htmlSections) {
+    const rows = parseTransactionHtml(html, termId);
+    if (rows.length > 0) return rows;
+  }
+  return [];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Parse transaction table from raw HTML string
 // ─────────────────────────────────────────────────────────────────────────────
 
 function parseTransactionHtml(html: string, termId: string): ColumbusTransactionRecord[] {
@@ -311,7 +341,7 @@ function parseTransactionHtml(html: string, termId: string): ColumbusTransaction
     const amtReqdIdx = idx("amtreqd") >= 0 ? idx("amtreqd") : idx("amtrequested");
     const feeReqdIdx = idx("feereqd") >= 0 ? idx("feereqd") : idx("feelrequested");
     const amtDispIdx = idx("amtdisp") >= 0 ? idx("amtdisp") : idx("amtdispensed");
-    const feeAmtIdx  = idx("feeamt") >= 0 ? idx("feeamt") : idx("feeamount");
+    const feeAmtIdx  = idx("feeamt")  >= 0 ? idx("feeamt")  : idx("feeamount");
     const seqIdx     = idx("termseq") >= 0 ? idx("termseq") : idx("seq");
     const respIdx    = idx("response");
 
@@ -347,7 +377,81 @@ function parseTransactionHtml(html: string, termId: string): ColumbusTransaction
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Debug: run one terminal and return diagnostics
+// Parse transaction table from live DOM (Puppeteer page)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function parseTableFromDom(page: Page, termId: string): Promise<ColumbusTransactionRecord[]> {
+  return page.evaluate((tid: string) => {
+    function cell(el: Element | null | undefined): string {
+      return (el?.textContent ?? "").replace(/\s+/g, " ").trim();
+    }
+    function parseDollar(raw: string): number | null {
+      const n = parseFloat(raw.replace(/[$,\s]/g, ""));
+      return isNaN(n) ? null : n;
+    }
+
+    const tables = Array.from(document.querySelectorAll("table"));
+    let best: HTMLTableElement | null = null;
+    let bestScore = 0;
+    for (const t of tables) {
+      const txt = (t.textContent ?? "").toLowerCase();
+      let s = 0;
+      if (txt.includes("tran")) s += 3;
+      if (txt.includes("card")) s += 2;
+      if (txt.includes("amt"))  s += 2;
+      if (txt.includes("fee"))  s += 1;
+      if (s > bestScore && t.rows.length > 2) { bestScore = s; best = t; }
+    }
+    if (!best || bestScore < 4) return [];
+
+    const allRows = Array.from(best.querySelectorAll("tr"));
+    const headerRow = allRows.find(r => {
+      const t = (r.textContent ?? "").toLowerCase().replace(/\s+/g, "");
+      return (t.includes("tran") || t.includes("datetime")) && (t.includes("amt") || t.includes("card"));
+    });
+    if (!headerRow) return [];
+
+    const headers = Array.from(headerRow.querySelectorAll("th,td"))
+      .map(h => cell(h).toLowerCase().replace(/\s+/g, ""));
+
+    const idx = (kw: string) => headers.findIndex(h => h.includes(kw.replace(/\s+/g, "")));
+    const dateIdx    = idx("datetime") >= 0 ? idx("datetime") : idx("date") >= 0 ? idx("date") : 0;
+    const typeIdx    = idx("trantype") >= 0 ? idx("trantype") : idx("type") >= 0 ? idx("type") : -1;
+    const cardIdx    = idx("card");
+    const amtReqdIdx = idx("amtreqd") >= 0 ? idx("amtreqd") : idx("amtrequested");
+    const feeReqdIdx = idx("feereqd") >= 0 ? idx("feereqd") : idx("feelrequested");
+    const amtDispIdx = idx("amtdisp") >= 0 ? idx("amtdisp") : idx("amtdispensed");
+    const feeAmtIdx  = idx("feeamt")  >= 0 ? idx("feeamt")  : idx("feeamount");
+    const seqIdx     = idx("termseq") >= 0 ? idx("termseq") : idx("seq");
+    const respIdx    = idx("response");
+
+    const result: {terminalId:string;transactedAt:string;transactionType:string|null;cardNumber:string|null;amountRequested:number|null;feeRequested:number|null;amountDispensed:number|null;feeAmount:number|null;termSeq:string|null;response:string|null}[] = [];
+    const hi = allRows.indexOf(headerRow);
+    for (let i = hi + 1; i < allRows.length; i++) {
+      const cells = Array.from(allRows[i].querySelectorAll("td"));
+      if (cells.length < 2) continue;
+      const dateRaw = cell(cells[dateIdx]);
+      if (!dateRaw || /^total|grand|sub/i.test(dateRaw)) continue;
+      const g = (ix: number) => ix >= 0 && cells[ix] ? cell(cells[ix]) || null : null;
+      result.push({
+        terminalId: tid,
+        transactedAt: dateRaw,
+        transactionType: g(typeIdx),
+        cardNumber: g(cardIdx),
+        amountRequested: amtReqdIdx >= 0 ? parseDollar(cell(cells[amtReqdIdx])) : null,
+        feeRequested:    feeReqdIdx >= 0 ? parseDollar(cell(cells[feeReqdIdx])) : null,
+        amountDispensed: amtDispIdx >= 0 ? parseDollar(cell(cells[amtDispIdx])) : null,
+        feeAmount:       feeAmtIdx  >= 0 ? parseDollar(cell(cells[feeAmtIdx]))  : null,
+        termSeq:  g(seqIdx),
+        response: g(respIdx),
+      });
+    }
+    return result;
+  }, termId).catch(() => []);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Debug: comprehensive diagnostic for one terminal
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function debugScrapeTerminal(
@@ -367,40 +471,63 @@ export async function debugScrapeTerminal(
     });
 
     const page = await browser.newPage();
-    page.setDefaultNavigationTimeout(60_000);
-    page.setDefaultTimeout(30_000);
+    await page.setUserAgent(CHROME_UA);
+    await page.setViewport({ width: 1280, height: 900 });
+    page.setDefaultNavigationTimeout(90_000);
 
-    await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded" });
+    // ── Capture console logs and page errors ──────────────────────────────
+    const consoleLogs: string[] = [];
+    const pageErrors: string[] = [];
+    page.on("console", msg => {
+      const text = `[${msg.type()}] ${msg.text()}`;
+      if (!text.includes("favicon") && !text.includes("404")) {
+        consoleLogs.push(text);
+      }
+    });
+    page.on("pageerror", err => pageErrors.push(err.message));
+
+    // ── Capture ALL network requests (not just columbusdata.net) ──────────
+    const allRequests: { t: number; method: string; url: string }[] = [];
+    page.on("request", (req: HTTPRequest) => {
+      const u = req.url();
+      // Skip static assets
+      if (/\.(css|png|gif|jpg|woff|ico)(\?|$)/i.test(u)) return;
+      allRequests.push({ t: Date.now(), method: req.method(), url: u });
+    });
+
+    // ── Capture ALL responses (no domain filter) ──────────────────────────
+    const allResponses: { t: number; method: string; url: string; status: number; bodyLen: number; snippet: string }[] = [];
+    page.on("response", async (resp: HTTPResponse) => {
+      const u = resp.url();
+      if (/\.(css|png|gif|jpg|woff|ico)(\?|$)/i.test(u)) return;
+      try {
+        const text = await resp.text().catch(() => "");
+        allResponses.push({
+          t: Date.now(),
+          method: resp.request().method(),
+          url: u,
+          status: resp.status(),
+          bodyLen: text.length,
+          snippet: text.substring(0, 800),
+        });
+      } catch {}
+    });
+
+    // ── Login ─────────────────────────────────────────────────────────────
+    await page.goto(LOGIN_URL, { waitUntil: "load" });
     await page.waitForSelector("#UsernameTextbox", { visible: true });
     await page.type("#UsernameTextbox", username, { delay: 30 });
     await page.type("#PasswordTextbox", password, { delay: 30 });
     await Promise.all([
-      page.waitForNavigation({ waitUntil: "domcontentloaded" }),
+      page.waitForNavigation({ waitUntil: "load" }),
       page.click("#LoginButton"),
     ]);
     diag.loginOk = !/login/i.test(page.url());
-    if (!diag.loginOk) return diag;
+    if (!diag.loginOk) { diag.consoleLogs = consoleLogs; return diag; }
 
     const end   = new Date();
     const start = new Date();
     start.setDate(start.getDate() - 60);
-
-    // Intercept ALL XHRs to see what's being fired (not just SSRS handler)
-    const ssrsRequests: { url: string; status: number; bodyLen: number; snippet: string }[] = [];
-    page.on("response", async (resp) => {
-      try {
-        const url = resp.url();
-        if (url.includes("columbusdata.net") && !url.includes("OpType=Resource")) {
-          const text = await resp.text().catch(() => "");
-          ssrsRequests.push({
-            url: url.replace(/https?:\/\/[^/]+/, ""),
-            status: resp.status(),
-            bodyLen: text.length,
-            snippet: text.substring(0, 500),
-          });
-        }
-      } catch {}
-    });
 
     const url =
       `${REPORT_BASE}?reportname=${REPORT_NAME}` +
@@ -409,29 +536,79 @@ export async function debugScrapeTerminal(
       `&EndDate=${encodeURIComponent(formatDate(end))}`;
 
     diag.url = url;
-    await page.goto(url, { waitUntil: "domcontentloaded" });
 
-    // Wait 35s to observe all SSRS XHRs
-    await new Promise(r => setTimeout(r, 35_000));
+    // Clear request/response lists (only capture after navigation to report)
+    allRequests.length = 0;
+    allResponses.length = 0;
+    consoleLogs.length  = 0;
 
-    diag.ssrsRequests = ssrsRequests;
-    diag.pageUrl = page.url();
+    const t0 = Date.now();
+    await page.goto(url, { waitUntil: "load" });
+    diag.loadMs = Date.now() - t0;
+
+    // ── Capture initial page state ────────────────────────────────────────
+    diag.initialState = await page.evaluate(() => {
+      const win = window as any;
+      return {
+        hasDoPostBack:  typeof win.__doPostBack === "function",
+        hasSM:          typeof win.Sys?.WebForms?.PageRequestManager !== "undefined",
+        rvFound:        !!win.$find?.("ReportViewer1"),
+        rvClientState:  win.$find?.("ReportViewer1")?._clientState ?? null,
+        parametersRow:  document.getElementById("ParametersRowReportViewer1")?.style.display ?? "not found",
+        asyncWait:      document.getElementById("AsyncWaitReportViewer1") ? "found" : "not found",
+        pageTitle:      document.title,
+        bodySnippet:    document.body?.innerHTML?.substring(0, 2000) ?? "",
+      };
+    });
+
+    // Wait 15s then check if explicit __doPostBack is needed
+    await sleep(15_000);
+
+    diag.stateAt15s = await page.evaluate(() => {
+      return {
+        asyncWaitVisible: (document.getElementById("AsyncWaitReportViewer1") as HTMLElement)?.style.display !== "none",
+        bodySnippet: document.body?.innerHTML?.substring(0, 2000) ?? "",
+        tableCount: document.querySelectorAll("table").length,
+      };
+    });
+
+    // Explicitly fire postback if still stuck
+    const hasPostResponse = allResponses.some(r => r.method === "POST" && r.url.includes("ReportViewer"));
+    if (!hasPostResponse) {
+      logger.info("debug: no POST seen after 15s, calling __doPostBack explicitly");
+      await page.evaluate(() => {
+        try {
+          const btn = document.querySelector<HTMLInputElement>("#ReportViewer1_ctl03_ctl00, input[id*='ctl03_ctl00']");
+          if (btn) { btn.click(); return; }
+        } catch {}
+        try {
+          if (typeof (window as any).__doPostBack === "function") {
+            (window as any).__doPostBack("ReportViewer1$ctl03$ctl00", "");
+          }
+        } catch {}
+      });
+    }
+
+    // Wait another 30s
+    await sleep(30_000);
+
+    diag.pageUrl   = page.url();
     diag.pageTitle = await page.title();
+    diag.finalHtmlSnippet = (await page.content()).substring(0, 3000);
 
-    // Check DOM for any table data
-    const tableInfo = await page.evaluate(() => {
-      const tables = Array.from(document.querySelectorAll("table"));
-      return tables.map(t => ({
+    diag.allRequests  = allRequests.map(r => ({ ...r, t: r.t - t0 }));
+    diag.allResponses = allResponses.map(r => ({ ...r, t: r.t - t0 }));
+    diag.consoleLogs  = consoleLogs;
+    diag.pageErrors   = pageErrors;
+
+    // DOM table summary
+    diag.domTables = await page.evaluate(() =>
+      Array.from(document.querySelectorAll("table")).map(t => ({
         id: t.id,
         rows: t.rows.length,
         snippet: (t.textContent ?? "").substring(0, 200),
-      }));
-    });
-    diag.domTables = tableInfo;
-
-    // Check for iframes
-    const frameInfo = page.frames().map(f => ({ url: f.url(), name: f.name() }));
-    diag.frames = frameInfo;
+      }))
+    );
 
   } finally {
     await browser?.close().catch(() => {});
