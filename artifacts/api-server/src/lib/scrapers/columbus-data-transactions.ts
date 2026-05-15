@@ -834,20 +834,29 @@ export async function debugScrapeTerminal(
       };
     }).catch((e: Error) => ({ error: String(e) }));
 
-    // Step 1: Set terminal via type-to-search (triggers real Telerik keyup events)
+    // Step 1: Type terminal ID to trigger Telerik keyup → AJAX LoadOnDemand
     const comboInput = await page.$("#cbsTerminals_radTerminalSelector_Input");
     if (comboInput) {
-      await (comboInput as any).triple_click?.().catch(() => null);
       await page.click("#cbsTerminals_radTerminalSelector_Input");
       await page.evaluate(() => {
         const el = document.getElementById("cbsTerminals_radTerminalSelector_Input") as HTMLInputElement;
         if (el) { el.value = ""; el.select(); }
       });
       await page.type("#cbsTerminals_radTerminalSelector_Input", termId, { delay: 80 });
-      await sleep(2_000); // Wait for Telerik AJAX dropdown to appear
     }
 
-    // Check if items loaded after typing
+    // Wait for Telerik dropdown DOM items to appear (.rcbItem) — up to 5s
+    await page.waitForSelector(".rcbItem", { timeout: 5_000 }).catch(() => null);
+    await sleep(500);
+
+    // Check DOM for visible dropdown items (before Telerik JS model)
+    diag.journalDomItems = await page.evaluate(() =>
+      Array.from(document.querySelectorAll(".rcbItem, [class*='rcbItem']"))
+        .map(el => ({ text: el.textContent?.trim() ?? "", id: el.id }))
+        .slice(0, 10)
+    ).catch(() => []);
+
+    // Check Telerik JS model items count
     diag.journalDropdownItems = await page.evaluate(() => {
       const w = window as any;
       const combo = w.$find?.("cbsTerminals_radTerminalSelector");
@@ -861,23 +870,31 @@ export async function debugScrapeTerminal(
       return { count: items.get_count(), first10: result };
     }).catch((e: Error) => ({ error: String(e) }));
 
-    // Try to select item from loaded dropdown, or craft ClientState fallback
+    // Try clicking matching DOM item first (if dropdown is open)
+    diag.journalDomClick = await page.evaluate((targetId: string) => {
+      const items = Array.from(document.querySelectorAll(".rcbItem, [class*='rcbItem']"));
+      const match = items.find(el => el.textContent?.includes(targetId));
+      if (match) {
+        (match as HTMLElement).click();
+        return `clicked DOM .rcbItem: ${match.textContent?.trim()}`;
+      }
+      return "no .rcbItem matched";
+    }, termId).catch((e: Error) => String(e));
+
+    // If DOM click didn't select an item, use Telerik JS API or craft ClientState
     diag.journalSelectResult = await page.evaluate((targetId: string) => {
       const w = window as any;
       const combo = w.$find?.("cbsTerminals_radTerminalSelector");
       if (!combo) return "combo not found";
       const items = combo.get_items();
-      if (items.get_count() > 0) {
-        for (let i = 0; i < items.get_count(); i++) {
-          const item = items.getItem(i);
-          if (item.get_value() === targetId || item.get_text().includes(targetId)) {
-            item.select();
-            return `selected[${i}]: value=${item.get_value()} text=${item.get_text()}`;
-          }
+      for (let i = 0; i < items.get_count(); i++) {
+        const item = items.getItem(i);
+        if (item.get_value() === targetId || item.get_text().includes(targetId)) {
+          item.select();
+          return `JS-selected[${i}]: value=${item.get_value()} text=${item.get_text()}`;
         }
-        return `items loaded (${items.get_count()}) but ${targetId} not found`;
       }
-      // Fallback: directly set inputs + craft ClientState
+      // Last resort: craft ClientState directly
       const input = document.getElementById("cbsTerminals_radTerminalSelector_Input") as HTMLInputElement;
       const stateInput = document.getElementById("cbsTerminals_radTerminalSelector_ClientState") as HTMLInputElement;
       if (input && stateInput) {
@@ -886,7 +903,7 @@ export async function debugScrapeTerminal(
           logEntries: [{ type: 5, index: 0, value: targetId, text: targetId }],
           selectedIndices: [0],
         });
-        return `crafted ClientState: text=${targetId}`;
+        return `crafted ClientState for ${targetId}`;
       }
       return "no fallback available";
     }, termId).catch((e: Error) => String(e));
@@ -905,20 +922,20 @@ export async function debugScrapeTerminal(
       return `begin=${sf} end=${ef}`;
     }, startFmt, endFmt, startDisplay, endDisplay).catch((e: Error) => String(e));
 
-    // Step 3: Submit — try __doPostBack('lnkView','') first, then form.submit()
+    // Step 3: Submit — set __EVENTTARGET=lnkView then submit form
+    // (avoids calling __doPostBack directly which throws in strict-mode evaluate context)
     try {
       await Promise.all([
         page.waitForNavigation({ waitUntil: "load", timeout: 15_000 }).catch(() => null),
         page.evaluate(() => {
-          const w = window as any;
-          if (typeof w.__doPostBack === "function") {
-            w.__doPostBack("lnkView", "");
-          } else {
-            (document.querySelector<HTMLFormElement>("#Form1, form"))?.submit();
-          }
+          const t = document.getElementById("__EVENTTARGET") as HTMLInputElement;
+          const a = document.getElementById("__EVENTARGUMENT") as HTMLInputElement;
+          if (t) t.value = "lnkView";
+          if (a) a.value = "";
+          (document.getElementById("Form1") as HTMLFormElement)?.submit();
         }),
       ]);
-      diag.journalSubmitMethod = "__doPostBack(lnkView) or form.submit()";
+      diag.journalSubmitMethod = "EVENTTARGET=lnkView + form.submit()";
     } catch (e) {
       diag.journalSubmitError = String(e);
     }
