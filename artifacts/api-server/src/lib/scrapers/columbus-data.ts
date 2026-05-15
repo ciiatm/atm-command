@@ -712,3 +712,143 @@ async function scrapeStatusGrid(page: Page): Promise<GridRow[]> {
 
   return rows;
 }
+
+// ---------------------------------------------------------------------------
+// Debug: probe the portal for address data from non-SSRS sources
+// ---------------------------------------------------------------------------
+
+export async function debugScrapeAddress(
+  username: string,
+  password: string,
+): Promise<Record<string, unknown>> {
+  let browser: Browser | null = null;
+  const diag: Record<string, unknown> = {};
+
+  const sleepMs = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+
+  try {
+    const executablePath = findChromiumExecutable();
+    browser = await puppeteer.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--no-zygote", "--single-process"],
+      executablePath,
+    });
+
+    const page = await browser.newPage();
+    await page.setUserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
+    await page.setViewport({ width: 1280, height: 900 });
+    page.setDefaultNavigationTimeout(30_000);
+    page.setDefaultTimeout(15_000);
+
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+      Object.defineProperty(navigator, "plugins",   { get: () => [1, 2, 3, 4, 5] });
+      Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
+    });
+
+    // Login
+    await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded" });
+    await page.waitForSelector("#UsernameTextbox", { visible: true });
+    await page.type("#UsernameTextbox", username, { delay: 30 });
+    await page.type("#PasswordTextbox", password, { delay: 30 });
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: "domcontentloaded" }),
+      page.click("#LoginButton"),
+    ]);
+    diag.afterLoginUrl = page.url();
+    if (/login/i.test(page.url())) {
+      diag.error = "login failed"; return diag;
+    }
+
+    // ── 1. Status grid: check if terminal rows have detail-page links ──────
+    await page.goto(GRID_URL, { waitUntil: "load" });
+    await sleepMs(2_000);
+
+    diag.gridLinks = await page.evaluate(() => {
+      const links: string[] = [];
+      document.querySelectorAll("table[id*='rgTermStatusReport'] a[href]").forEach(a => {
+        const href = (a as HTMLAnchorElement).href;
+        if (href && !links.includes(href)) links.push(href);
+      });
+      return links.slice(0, 20);
+    });
+
+    diag.gridFirstRowHtml = await page.evaluate(() => {
+      const row = document.querySelector("table[id*='rgTermStatusReport'] tr.rgRow, table[id*='rgTermStatusReport'] tr.rgAltRow");
+      return row ? row.innerHTML.slice(0, 800) : "no row found";
+    });
+
+    // ── 2. Probe common terminal-detail URLs ──────────────────────────────
+    const FIRST_TERM = "L745870"; // Known good terminal
+    const PROBE_URLS = [
+      `https://www.columbusdata.net/cdswebtool/TerminalMonitoring/TerminalDetails.aspx?TermID=${FIRST_TERM}`,
+      `https://www.columbusdata.net/cdswebtool/TerminalMonitoring/TerminalInfo.aspx?TermID=${FIRST_TERM}`,
+      `https://www.columbusdata.net/cdswebtool/QuickView/TerminalDetails.aspx?TermID=${FIRST_TERM}`,
+      `https://www.columbusdata.net/cdswebtool/QuickView/TerminalInfo.aspx?TermID=${FIRST_TERM}`,
+      `https://www.columbusdata.net/cdswebtool/TerminalManagement/EditTerminal.aspx?TermID=${FIRST_TERM}`,
+      `https://www.columbusdata.net/cdswebtool/TerminalManagement/TerminalDetails.aspx?TermID=${FIRST_TERM}`,
+      `https://www.columbusdata.net/cdswebtool/Setup/TerminalSetup.aspx?TermID=${FIRST_TERM}`,
+    ];
+
+    const probeResults: Record<string, unknown>[] = [];
+    for (const probeUrl of PROBE_URLS) {
+      try {
+        await page.goto(probeUrl, { waitUntil: "load", timeout: 12_000 });
+        const finalUrl = page.url();
+        const bodySnippet = await page.evaluate(() =>
+          (document.body?.innerText ?? "").slice(0, 400).replace(/\s+/g, " ").trim()
+        ).catch(() => "");
+        const has404 = /404|not found|error/i.test(bodySnippet) || finalUrl.includes("404") || finalUrl.includes("Error");
+        probeResults.push({ url: probeUrl, finalUrl, has404, bodySnippet });
+        if (!has404 && finalUrl === probeUrl) break; // Found a working page
+      } catch (e) {
+        probeResults.push({ url: probeUrl, error: (e as Error).message });
+      }
+    }
+    diag.probeResults = probeResults;
+
+    // ── 3. Check portal home page nav links ───────────────────────────────
+    try {
+      const homeUrl = "https://www.columbusdata.net/cdswebtool/";
+      await page.goto(homeUrl, { waitUntil: "load", timeout: 10_000 });
+      diag.homeUrl = page.url();
+      diag.homeNavLinks = await page.evaluate(() => {
+        const links: string[] = [];
+        document.querySelectorAll("a[href]").forEach(a => {
+          const href = (a as HTMLAnchorElement).href;
+          if (href && href.includes("columbusdata") && !links.includes(href)) links.push(href);
+        });
+        return links.slice(0, 30);
+      });
+    } catch (e) {
+      diag.homeError = (e as Error).message;
+    }
+
+    // ── 4. Try clicking the first terminal row to see where it goes ───────
+    try {
+      await page.goto(GRID_URL, { waitUntil: "load", timeout: 15_000 });
+      await sleepMs(1_500);
+      const clicked = await page.evaluate(() => {
+        const firstRow = document.querySelector("table[id*='rgTermStatusReport'] tr.rgRow, table[id*='rgTermStatusReport'] tr.rgAltRow");
+        if (!firstRow) return "no row";
+        const link = firstRow.querySelector("a");
+        if (link) { (link as HTMLAnchorElement).click(); return "clicked link: " + (link as HTMLAnchorElement).href; }
+        (firstRow as HTMLElement).click();
+        return "clicked row";
+      });
+      diag.gridRowClickResult = clicked;
+      await sleepMs(2_000);
+      diag.afterRowClickUrl = page.url();
+      diag.afterRowClickBodySnippet = await page.evaluate(() =>
+        (document.body?.innerText ?? "").slice(0, 600).replace(/\s+/g, " ").trim()
+      ).catch(() => "");
+    } catch (e) {
+      diag.gridRowClickError = (e as Error).message;
+    }
+
+  } finally {
+    await browser?.close().catch(() => {});
+  }
+
+  return diag;
+}

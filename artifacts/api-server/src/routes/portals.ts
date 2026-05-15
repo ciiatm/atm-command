@@ -15,7 +15,7 @@ import {
   DeletePortalParams,
   SyncPortalParams,
 } from "@workspace/api-zod";
-import { scrapeColumbusData } from "../lib/scrapers/columbus-data.js";
+import { scrapeColumbusData, debugScrapeAddress } from "../lib/scrapers/columbus-data.js";
 import { scrapeColumbusTransactions, debugScrapeTerminal } from "../lib/scrapers/columbus-data-transactions.js";
 
 const PORTAL_CONFIG: Record<
@@ -220,6 +220,22 @@ router.post("/portals/:id/debug-tx", async (req, res) => {
 
   try {
     const diag = await debugScrapeTerminal(portal.username, portal.passwordEncrypted, terminalId);
+    res.json(diag);
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message, stack: (err as Error).stack });
+  }
+});
+
+// POST /portals/:id/debug-address
+router.post("/portals/:id/debug-address", async (req, res) => {
+  const params = SyncPortalParams.safeParse({ id: Number(req.params.id) });
+  if (!params.success) { res.status(400).json({ error: "Invalid id" }); return; }
+
+  const [portal] = await db.select().from(portalsTable).where(eq(portalsTable.id, params.data.id));
+  if (!portal) { res.status(404).json({ error: "Portal not found" }); return; }
+
+  try {
+    const diag = await debugScrapeAddress(portal.username, portal.passwordEncrypted);
     res.json(diag);
   } catch (err) {
     res.status(500).json({ error: (err as Error).message, stack: (err as Error).stack });
