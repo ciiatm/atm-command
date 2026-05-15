@@ -106,6 +106,7 @@ export async function debugScrapeTerminal(
   const controlId = extractControlId(pageHtml);
   diag.viewStateLen = viewState?.length ?? 0;
   diag.controlId = controlId;
+  diag.fullGetHtml = pageHtml; // full HTML so we can inspect parameter inputs
 
   if (!viewState) return diag;
 
