@@ -797,17 +797,47 @@ export async function debugScrapeTerminal(
     };
 
     // ── Test journal.aspx (Real-time Transactions → Online Journals) ──────
-    const journalUrl = `https://www.columbusdata.net/cdswebtool/TerminalMonitoring/journal.aspx?TermID=${encodeURIComponent(termId)}&StartDate=${encodeURIComponent(formatDate(start))}&EndDate=${encodeURIComponent(formatDate(end))}`;
+    // journal.aspx is a simple HTML/ASP.NET page (no SSRS!). It has a form
+    // with terminal selector + date/time range + "View Journal" button.
+    // URL params TermID/StartDate/EndDate should pre-fill or be used via POST.
+    const journalBase = `https://www.columbusdata.net/cdswebtool/TerminalMonitoring/journal.aspx`;
+    const journalUrl = `${journalBase}?TermID=${encodeURIComponent(termId)}&StartDate=${encodeURIComponent(formatDate(start))}&EndDate=${encodeURIComponent(formatDate(end))}`;
     diag.journalUrl = journalUrl;
     await page.goto(journalUrl, { waitUntil: "load" });
-    await sleep(2_000);
+    await sleep(1_000);
+
+    // Inspect form fields on journal.aspx
+    diag.journalFormFields = await page.evaluate(() =>
+      Array.from(document.querySelectorAll("input, select, textarea, button[type=submit]"))
+        .filter((el: Element) => (el as HTMLInputElement).name || (el as HTMLButtonElement).type === "submit")
+        .map((el: Element) => {
+          const e = el as HTMLInputElement;
+          return `${e.tagName}[type=${e.type}][name=${e.name}][id=${e.id}] value=${(e.value||"").substring(0,30)}`;
+        })
+    ).catch(() => []);
+
+    // Try to click "View Journal" button
+    try {
+      await page.click("input[value*='View'], button:contains('View'), input[id*='btnView'], input[id*='View']");
+      await sleep(3_000);
+    } catch { /* button not found, try submit */ }
+
+    // Try to submit the form directly if clicking didn't work
+    try {
+      await page.evaluate(() => {
+        const form = document.querySelector<HTMLFormElement>("#Form1, form");
+        form?.submit();
+      });
+      await sleep(3_000);
+    } catch {}
+
     diag.journal = {
       url: page.url(),
       title: await page.title(),
       bodySnippet: (await page.content()).substring(0, 3000),
       domTables: await page.evaluate(() =>
         Array.from(document.querySelectorAll("table")).map(t => ({
-          id: t.id, rows: t.rows.length, text: (t.textContent ?? "").substring(0, 400),
+          id: t.id, rows: t.rows.length, text: (t.textContent ?? "").substring(0, 500),
         }))
       ).catch(() => []),
     };
