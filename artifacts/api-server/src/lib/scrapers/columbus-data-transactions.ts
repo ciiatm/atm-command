@@ -577,6 +577,13 @@ export async function debugScrapeTerminal(
     }
     diag.controlId = controlId;
 
+    // ── Early frame check: what iframes exist after page load? ───────────
+    diag.framesAfterLoad = page.frames().map(f => ({ url: f.url(), name: f.name() }));
+
+    // Wait a bit more for SSRS JS to trigger any iframe navigations
+    await sleep(5_000);
+    diag.framesAfter5s = page.frames().map(f => ({ url: f.url(), name: f.name() }));
+
     // ── Helper: fire UpdatePanel POST and return section list ─────────────
     async function testPostback(target: string): Promise<string> {
       return page.evaluate(async (t: string): Promise<string> => {
@@ -629,7 +636,17 @@ export async function debugScrapeTerminal(
           const exportUrl = `/cdswebtool/Reserved.ReportViewerWebControl.axd?OpType=Export&Version=${encodeURIComponent(v)}&ControlID=${c}&Culture=en-US&UICulture=en-US&ReportStack=1&ExportFormat=CSV`;
           const resp = await fetch(exportUrl, { credentials: "include" });
           const text = await resp.text();
-          return `STATUS:${resp.status} REDIRECTED:${resp.redirected} LEN:${text.length} SNIPPET:${text.substring(0, 500)}`;
+          if (resp.status === 200) {
+            return `STATUS:200 REDIRECTED:${resp.redirected} LEN:${text.length} CSV_SNIPPET:${text.substring(0, 1000)}`;
+          }
+          // Extract ASP.NET error details
+          const descMatch = text.match(/<b>Description:<\/b>\s*(.*?)<\/p>/s);
+          const exMatch   = text.match(/<b>Exception Details:<\/b>\s*(.*?)<\/p>/s);
+          const msgMatch  = text.match(/<title>(.*?)<\/title>/);
+          const errMsg    = descMatch ? descMatch[1].replace(/<[^>]+>/g, "").trim() : "";
+          const exDetail  = exMatch   ? exMatch[1].replace(/<[^>]+>/g, "").trim().substring(0, 400) : "";
+          const title     = msgMatch  ? msgMatch[1] : "";
+          return `STATUS:${resp.status} REDIRECTED:${resp.redirected} LEN:${text.length} TITLE:${title} DESC:${errMsg} EX:${exDetail}`;
         } catch (e: any) { return `ERR:${e?.message}`; }
       }, ctrl, SSRS_VERSION).catch(() => "ERR:evaluate-threw");
     }
@@ -709,6 +726,28 @@ export async function debugScrapeTerminal(
     diag.pageUrl   = page.url();
     diag.pageTitle = await page.title();
     diag.finalHtmlSnippet = (await page.content()).substring(0, 3000);
+
+    // ── Frame inspection: check for cross-origin frames (e.g. cdsatm.com) ──
+    const frames = page.frames();
+    diag.frames = frames.map(f => ({ url: f.url(), name: f.name() }));
+    // Try to read HTML from any non-main frame (cross-origin frames may throw)
+    const frameDetails: Record<string, unknown>[] = [];
+    for (const frame of frames) {
+      if (frame === page.mainFrame()) continue;
+      try {
+        const fUrl  = frame.url();
+        const fHtml = await frame.content().catch(() => "");
+        const fTables = await frame.evaluate(() =>
+          Array.from(document.querySelectorAll("table")).map(t => ({
+            id: t.id, rows: t.rows.length, text: (t.textContent ?? "").substring(0, 300),
+          }))
+        ).catch(() => []);
+        frameDetails.push({ url: fUrl, htmlLen: fHtml.length, htmlSnippet: fHtml.substring(0, 1000), tables: fTables });
+      } catch (e: any) {
+        frameDetails.push({ url: frame.url(), error: e?.message });
+      }
+    }
+    diag.frameDetails = frameDetails;
 
     diag.allRequests  = allRequests.map(r => ({ ...r, t: r.t - t0 }));
     diag.allResponses = allResponses.map(r => ({ ...r, t: r.t - t0 }));
